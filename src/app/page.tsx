@@ -136,14 +136,18 @@ export default function Home() {
 
       let runId = run?.id;
 
-      if (!runId) {
-        const { data } = await supabase
-          .from("picking_runs")
-          .insert({ run_date: dateISO })
-          .select("id")
-          .single();
-        runId = data.id;
-      }
+      const { data: runRow, error: runErr } = await supabase
+  .from("picking_runs")
+  .select("id")
+  .eq("run_date", runDate)
+  .single();
+
+if (runErr || !runRow) {
+  throw new Error(runErr?.message ?? "Geen picking_run gevonden voor deze datum.");
+}
+
+runId = runRow.id;
+
 
       const { data: templ } = await supabase
         .from("picking_templates")
