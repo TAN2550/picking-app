@@ -1,11 +1,16 @@
 import { NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabase/server";
+import { createClient } from "@supabase/supabase-js";
+
+function serviceSupabase() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+  return createClient(url, key, { auth: { persistSession: false } });
+}
 
 export async function POST(req: Request) {
   try {
-    // ✅ bij jou is supabaseServer async
     const supabase = await supabaseServer();
-
     const body = await req.json();
     const { id, patch } = body ?? {};
 
@@ -13,7 +18,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Bad request" }, { status: 400 });
     }
 
-    // 1) Update picking line (belangrijkste)
+    // 1) update picking_lines (gewoon met anon/login client)
     const { data: updated, error: updErr } = await supabase
       .from("picking_lines")
       .update(patch)
@@ -28,15 +33,19 @@ export async function POST(req: Request) {
       );
     }
 
-    // 2) Audit proberen, maar nooit crashen
+    // 2) audit via service role (bypass RLS)
     let auditWarning: any = null;
     try {
-      const { error: auditErr } = await supabase.from("picking_line_audit").insert({
-        line_id: id,
+      const svc = serviceSupabase();
+      const { error: auditErr } = await svc.from("picking_line_audit").insert({
         changed_at: new Date().toISOString(),
-        new_picker: patch.picker ?? null,
-        new_status: patch.status ?? null,
-      } as any);
+        run_id: updated.run_id,
+        store_id: updated.store_id,
+        metal: updated.metal,
+        // optioneel extra velden als je die hebt:
+        // picker: updated.picker,
+        // status: updated.status,
+      });
 
       if (auditErr) auditWarning = { message: auditErr.message, code: auditErr.code };
     } catch (e: any) {
