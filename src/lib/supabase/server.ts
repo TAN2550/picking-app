@@ -12,8 +12,10 @@ export async function supabaseServer() {
         getAll() {
           return cookieStore.getAll();
         },
-        setAll() {
-          // We gebruiken voorlopig geen auth-sessie cookies.
+        setAll(cookiesToSet) {
+          for (const { name, value, options } of cookiesToSet) {
+            cookieStore.set(name, value, options);
+          }
         },
       },
     }

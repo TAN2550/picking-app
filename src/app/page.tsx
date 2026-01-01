@@ -1,19 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { createClient, type Session } from "@supabase/supabase-js";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { supabaseBrowser } from "@/lib/supabase/client";
 
 type Status = "TE_DOEN" | "BEZIG" | "KLAAR";
 type Metal = "ZILVER" | "STAAL";
 
-type Store = {
-  id: string;
-  code: string;
-  name: string;
-  active?: boolean;
-};
-
-type Line = {
+type StoreRow = { id: string; code: string; name: string; active?: boolean };
+type LineRow = {
   id: string;
   run_id: string;
   store_id: string;
@@ -23,620 +17,485 @@ type Line = {
   stores?: { code: string; name: string } | null;
 };
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-);
+const WEEKDAYS: { label: string; value: number }[] = [
+  { label: "Dinsdag", value: 2 },
+  { label: "Woensdag", value: 3 },
+  { label: "Donderdag", value: 4 },
+  { label: "Vrijdag", value: 5 },
+];
 
-const DAY_OPTIONS = [
-  { label: "Dinsdag", weekday: 2 },
-  { label: "Woensdag", weekday: 3 },
-  { label: "Donderdag", weekday: 4 },
-  { label: "Vrijdag", weekday: 5 },
-] as const;
-
-const STATUS_BG: Record<Status, string> = {
-  TE_DOEN: "#ffffff",
-  BEZIG: "#ff6b6b", // duidelijker rood
-  KLAAR: "#3ddc84", // duidelijker groen
-};
-
-const STATUS_LEFT: Record<Status, string> = {
-  TE_DOEN: "#e5e7eb",
-  BEZIG: "#e11d48",
-  KLAAR: "#16a34a",
-};
-
-function isoDate(d: Date) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const da = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${da}`;
+function pad2(n: number) {
+  return String(n).padStart(2, "0");
+}
+function formatLocalYYYYMMDD(d: Date) {
+  // Local date (geen UTC shift!)
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+function nlTitle(weekday: number, runDate: string) {
+  const map: Record<number, string> = { 2: "Dinsdag", 3: "Woensdag", 4: "Donderdag", 5: "Vrijdag" };
+  return `Picking – ${map[weekday] ?? "Dag"} ${runDate}`;
 }
 
-function dayLabelFromWeekday(weekday: number) {
-  return DAY_OPTIONS.find((d) => d.weekday === weekday)?.label ?? "Onbekend";
-}
-
-async function postJSON<T>(url: string, body: any): Promise<T> {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
-  }
-  return data as T;
+function rowBg(status: Status) {
+  // Duidelijker rood/groen
+  if (status === "KLAAR") return "rgba(0, 160, 60, 0.30)";
+  if (status === "BEZIG") return "rgba(220, 0, 0, 0.25)";
+  return "transparent";
 }
 
 export default function Home() {
-  // ⚠️ Geen conditionele hooks (iPhone/React hook order issues vermijden)
-  const [session, setSession] = useState<Session | null>(null);
-  const [checkingSession, setCheckingSession] = useState(true);
+  const supabase = useMemo(() => supabaseBrowser(), []);
 
-  // Login form
+  // --- Auth / session ---
+  const [session, setSession] = useState<any>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  // --- Login form ---
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [loginBusy, setLoginBusy] = useState(false);
 
-  // App state
-  const [runDate, setRunDate] = useState<string>(() => isoDate(new Date()));
+  // --- Picking state ---
+  const [runDate, setRunDate] = useState<string>(() => formatLocalYYYYMMDD(new Date()));
   const [weekday, setWeekday] = useState<number>(() => {
-    // default: huidige dag -> als weekend/maandag, neem dinsdag
-    const jsDay = new Date().getDay(); // 0=zo..6=za
-    const map: Record<number, number> = { 0: 2, 1: 2, 2: 2, 3: 3, 4: 4, 5: 5, 6: 2 };
+    const jsDay = new Date().getDay(); // 0..6 (zo=0)
+    const map: Record<number, number> = { 2: 2, 3: 3, 4: 4, 5: 5 };
+    // als weekend/maandag: default dinsdag
     return map[jsDay] ?? 2;
   });
 
   const [loading, setLoading] = useState(false);
-  const [lines, setLines] = useState<Line[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [runId, setRunId] = useState<string | null>(null);
+  const [info, setInfo] = useState<string>("");
+  const [lines, setLines] = useState<LineRow[]>([]);
+  const [savingIds, setSavingIds] = useState<Record<string, boolean>>({});
 
-  // debounce save queue (minder spam)
   const saveTimers = useRef<Record<string, any>>({});
 
-  const doneCount = useMemo(() => lines.filter((l) => l.status === "KLAAR").length, [lines]);
+  const klaarCount = useMemo(() => lines.filter((l) => l.status === "KLAAR").length, [lines]);
   const totalCount = useMemo(() => lines.length, [lines]);
 
-  // ---- Session init
+  // --- Auth init ---
   useEffect(() => {
-    let mounted = true;
+    let unsub: any = null;
 
     (async () => {
-      try {
-        const { data } = await supabase.auth.getSession();
-        if (!mounted) return;
-        setSession(data.session ?? null);
-      } finally {
-        if (mounted) setCheckingSession(false);
-      }
+      const { data } = await supabase.auth.getSession();
+      setSession(data.session ?? null);
+      setAuthLoading(false);
+
+      const { data: sub } = supabase.auth.onAuthStateChange((_event, sess) => {
+        setSession(sess);
+      });
+      unsub = sub.subscription;
     })();
 
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => {
-      setSession(s);
-    });
-
     return () => {
-      mounted = false;
-      sub.subscription.unsubscribe();
+      if (unsub) unsub.unsubscribe();
     };
-  }, []);
+  }, [supabase]);
 
-  async function login() {
-    setLoginBusy(true);
-    setError(null);
-    try {
-      const { error: e } = await supabase.auth.signInWithPassword({ email, password });
-      if (e) throw e;
-    } catch (e: any) {
-      setError(e?.message ?? "Login mislukt");
-    } finally {
-      setLoginBusy(false);
-    }
+  async function signIn(e: React.FormEvent) {
+    e.preventDefault();
+    setInfo("");
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) setInfo(error.message);
   }
 
-  async function logout() {
+  async function signOut() {
     await supabase.auth.signOut();
-    setLines([]);
-    setRunId(null);
   }
 
-  // ---- Load data (runs/templates/lines)
-  async function loadAll(dateStr: string, weekdayNum: number) {
+  // --- Load picking data ---
+  async function load() {
     setLoading(true);
-    setError(null);
+    setInfo("");
 
     try {
-      // 1) run ophalen of maken op run_date
-      const { data: existingRun, error: runSelErr } = await supabase
+      // 1) Find or create run
+      const runRes = await supabase
         .from("picking_runs")
         .select("id")
-        .eq("run_date", dateStr)
+        .eq("run_date", runDate)
         .maybeSingle();
 
-      if (runSelErr) throw runSelErr;
+      if (runRes.error) throw runRes.error;
 
-      let rid = existingRun?.id as string | undefined;
+      let runId = runRes.data?.id as string | undefined;
 
-      if (!rid) {
-        const { data: createdRun, error: runInsErr } = await supabase
+      if (!runId) {
+        const created = await supabase
           .from("picking_runs")
-          .insert([{ run_date: dateStr, day_name: dayLabelFromWeekday(weekdayNum) }])
+          .insert({ run_date: runDate })
           .select("id")
           .single();
-
-        if (runInsErr) throw runInsErr;
-        rid = createdRun?.id;
+        if (created.error) throw created.error;
+        runId = created.data.id;
       }
 
-      if (!rid) throw new Error("Kon run niet maken/ophalen");
-      setRunId(rid);
-
-      // 2) templates voor die weekday -> store_id’s
-      const { data: templ, error: templErr } = await supabase
+      // 2) template stores voor gekozen weekday
+      const templ = await supabase
         .from("picking_templates")
         .select("store_id")
-        .eq("weekday", weekdayNum);
+        .eq("weekday", weekday);
 
-      if (templErr) throw templErr;
+      if (templ.error) throw templ.error;
 
-      const storeIds = (templ ?? []).map((t: any) => t.store_id).filter(Boolean);
+      const storeIds = (templ.data ?? []).map((t: any) => t.store_id).filter(Boolean);
 
       if (storeIds.length === 0) {
         setLines([]);
+        setInfo("Geen winkels in template voor deze picking dag.");
         return;
       }
 
-      // 3) stores ophalen
-      const { data: storeRows, error: storesErr } = await supabase
-        .from("stores")
-        .select("id, code, name, active")
-        .in("id", storeIds);
-
-      if (storesErr) throw storesErr;
-
-      const stores: Store[] = (storeRows ?? []).map((s: any) => ({
-        id: s.id,
-        code: s.code,
-        name: s.name,
-        active: s.active,
-      }));
-
-      // 4) bestaande lijnen ophalen
-      const { data: existingLines, error: linesErr } = await supabase
-        .from("picking_lines")
-        .select("id, run_id, store_id, metal, picker, status")
-        .eq("run_id", rid)
-        .in("store_id", storeIds);
-
-      if (linesErr) throw linesErr;
-
-      // 5) missing lines aanmaken (per store: ZILVER + STAAL)
-      const need: { run_id: string; store_id: string; metal: Metal; status: Status }[] = [];
-      const key = (a: { store_id: string; metal: string }) => `${a.store_id}__${a.metal}`;
-      const existingSet = new Set((existingLines ?? []).map((l: any) => key(l)));
-
-      for (const s of stores) {
-        for (const metal of ["ZILVER", "STAAL"] as Metal[]) {
-          const k = `${s.id}__${metal}`;
-          if (!existingSet.has(k)) {
-            need.push({ run_id: rid, store_id: s.id, metal, status: "TE_DOEN" });
-          }
-        }
-      }
-
-      if (need.length > 0) {
-        // Als je constraint op (run_id, store_id, metal) staat: dit werkt perfect.
-        // Anders: laat me weten en ik pas dit aan naar jouw exacte constraint.
-        const { error: insErr } = await supabase
-          .from("picking_lines")
-          .upsert(need, { onConflict: "run_id,store_id,metal" });
-
-        if (insErr) throw insErr;
-      }
-
-      // 6) finale lijst ophalen met store info
-      const { data: finalLines, error: finalErr } = await supabase
+      // 3) existing lines?
+      const existing = await supabase
         .from("picking_lines")
         .select("id, run_id, store_id, metal, picker, status, stores(code,name)")
-        .eq("run_id", rid)
+        .eq("run_id", runId)
         .in("store_id", storeIds);
 
-      if (finalErr) throw finalErr;
+      if (existing.error) throw existing.error;
 
-      const sorted = (finalLines ?? []) as Line[];
-      sorted.sort((a, b) => {
-        const ac = a.stores?.code ?? "";
-        const bc = b.stores?.code ?? "";
-        if (ac !== bc) return ac.localeCompare(bc);
-        // STAAL eerst? of ZILVER eerst? (nu STAAL bovenaan)
-        const am = a.metal === "STAAL" ? 0 : 1;
-        const bm = b.metal === "STAAL" ? 0 : 1;
-        return am - bm;
-      });
+      if ((existing.data ?? []).length === 0) {
+        // 4) create base lines (2x per store)
+        const base = storeIds.flatMap((sid: string) => [
+          { run_id: runId, store_id: sid, metal: "ZILVER", status: "TE_DOEN" as Status },
+          { run_id: runId, store_id: sid, metal: "STAAL", status: "TE_DOEN" as Status },
+        ]);
 
-      setLines(sorted);
+        // onConflict vereist UNIQUE(run_id, store_id, metal)
+        const up = await supabase
+          .from("picking_lines")
+          .upsert(base, { onConflict: "run_id,store_id,metal" });
+
+        if (up.error) throw up.error;
+
+        // reload
+        const reload = await supabase
+          .from("picking_lines")
+          .select("id, run_id, store_id, metal, picker, status, stores(code,name)")
+          .eq("run_id", runId)
+          .in("store_id", storeIds);
+
+        if (reload.error) throw reload.error;
+        setLines(sortLines(reload.data as any));
+      } else {
+        setLines(sortLines(existing.data as any));
+      }
     } catch (e: any) {
-      setError(e?.message ?? "Fout bij laden");
-      setLines([]);
-      setRunId(null);
+      console.error(e);
+      setInfo(e?.message ?? "Fout bij laden");
     } finally {
       setLoading(false);
     }
   }
 
-  // load bij wijziging datum/dag (maar enkel als ingelogd)
+  function sortLines(arr: LineRow[]) {
+    const metalOrder: Record<string, number> = { ZILVER: 0, STAAL: 1 };
+    return [...arr].sort((a, b) => {
+      const ac = a.stores?.code ?? "";
+      const bc = b.stores?.code ?? "";
+      if (ac !== bc) return ac.localeCompare(bc);
+      return (metalOrder[a.metal] ?? 9) - (metalOrder[b.metal] ?? 9);
+    });
+  }
+
+  // auto load bij change
   useEffect(() => {
     if (!session) return;
-    loadAll(runDate, weekday);
+    load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session, runDate, weekday]);
 
-  function queueSave(lineId: string, patch: Partial<Pick<Line, "picker" | "status">>) {
-    // optimistisch updaten in UI
+  // --- Save (debounced) ---
+  function queueSave(id: string, patch: Partial<Pick<LineRow, "picker" | "status">>) {
+    // optimistic update
     setLines((prev) =>
-      prev.map((l) => (l.id === lineId ? ({ ...l, ...patch } as Line) : l))
+      prev.map((l) => (l.id === id ? { ...l, ...patch } as LineRow : l))
     );
 
-    if (saveTimers.current[lineId]) clearTimeout(saveTimers.current[lineId]);
-
-    saveTimers.current[lineId] = setTimeout(async () => {
+    // debounce per row
+    if (saveTimers.current[id]) clearTimeout(saveTimers.current[id]);
+    saveTimers.current[id] = setTimeout(async () => {
+      setSavingIds((s) => ({ ...s, [id]: true }));
       try {
-        // ✅ Server-side update met service role (geen RLS/audit problemen)
-        await postJSON<{ ok: true }>("/api/update-line", { id: lineId, patch });
+        const res = await fetch("/api/update-line", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id, patch }),
+        });
+        const json = await res.json();
+
+        if (!res.ok) {
+          throw new Error(json?.error?.message ?? json?.error ?? "Update mislukt");
+        }
+        // auditError niet blokkeren
       } catch (e: any) {
-        setError(e?.message ?? "Opslaan mislukt");
-        // herladen om terug consistent te worden
-        if (runId) loadAll(runDate, weekday);
+        alert(e?.message ?? "Fout bij opslaan");
+      } finally {
+        setSavingIds((s) => {
+          const copy = { ...s };
+          delete copy[id];
+          return copy;
+        });
       }
     }, 250);
   }
 
-  // UI helpers
-  const title = useMemo(() => {
-    const d = new Date(runDate + "T00:00:00");
-    const day = DAY_OPTIONS.find((x) => x.weekday === weekday)?.label ?? "Picking";
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, "0");
-    const da = String(d.getDate()).padStart(2, "0");
-    return `Picking — ${day} ${y}-${m}-${da}`;
-  }, [runDate, weekday]);
+  // --- UI ---
+  if (authLoading) {
+    return <div style={{ padding: 16, fontFamily: "system-ui" }}>Laden…</div>;
+  }
 
-  // ---- Render
+  if (!session) {
+    return (
+      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 16, fontFamily: "system-ui" }}>
+        <form
+          onSubmit={signIn}
+          style={{
+            width: "100%",
+            maxWidth: 420,
+            border: "1px solid #e5e5e5",
+            borderRadius: 12,
+            padding: 16,
+            background: "white",
+          }}
+        >
+          <h1 style={{ margin: 0, fontSize: 22 }}>Login</h1>
+          <p style={{ marginTop: 8, color: "#666" }}>
+            Gebruik jullie algemene account.
+          </p>
+
+          <label style={{ display: "block", marginTop: 12, fontSize: 14 }}>Email</label>
+          <input
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ccc" }}
+            autoComplete="username"
+          />
+
+          <label style={{ display: "block", marginTop: 12, fontSize: 14 }}>Wachtwoord</label>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ccc" }}
+            autoComplete="current-password"
+          />
+
+          <button
+            type="submit"
+            style={{
+              marginTop: 14,
+              width: "100%",
+              padding: 12,
+              borderRadius: 10,
+              border: "0",
+              background: "#111",
+              color: "white",
+              fontWeight: 700,
+            }}
+          >
+            Inloggen
+          </button>
+
+          {info ? <div style={{ marginTop: 12, color: "crimson" }}>{info}</div> : null}
+        </form>
+      </div>
+    );
+  }
+
   return (
-    <div className="wrap">
-      <style jsx>{`
-        .wrap {
-          max-width: 980px;
-          margin: 0 auto;
-          padding: 16px;
-          font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
-          color: #111827;
-        }
+    <div style={{ fontFamily: "system-ui", padding: 14, maxWidth: 1100, margin: "0 auto" }}>
+      <style>{`
         .topbar {
           display: flex;
+          align-items: flex-start;
           justify-content: space-between;
           gap: 12px;
-          align-items: flex-start;
           flex-wrap: wrap;
         }
-        h1 {
-          margin: 0;
-          font-size: clamp(28px, 5vw, 44px);
-          line-height: 1.05;
-          letter-spacing: -0.02em;
-        }
-        .sub {
-          margin-top: 8px;
-          color: #374151;
-          font-size: 14px;
-        }
-        .controls {
+        .filters {
           display: flex;
-          gap: 12px;
+          gap: 10px;
           align-items: center;
           flex-wrap: wrap;
-          justify-content: flex-end;
         }
-        .ctrl {
-          display: flex;
-          gap: 8px;
-          align-items: center;
-          background: #f3f4f6;
-          padding: 10px 12px;
-          border-radius: 14px;
-        }
-        label {
-          font-size: 13px;
-          color: #111827;
-          font-weight: 600;
-          white-space: nowrap;
-        }
-        input[type="date"],
-        select,
-        input[type="text"],
-        input[type="email"],
-        input[type="password"] {
-          font-size: 16px; /* iOS zoom fix */
-          padding: 10px 12px;
-          border-radius: 12px;
-          border: 1px solid #d1d5db;
-          background: #fff;
-          outline: none;
-        }
-        .btn {
-          border: 0;
-          background: #111827;
-          color: #fff;
-          padding: 10px 14px;
-          border-radius: 12px;
-          font-weight: 700;
-        }
-        .btn:disabled {
-          opacity: 0.6;
-        }
-        .btnSecondary {
-          border: 1px solid #d1d5db;
-          background: #fff;
-          color: #111827;
-          padding: 10px 14px;
-          border-radius: 12px;
-          font-weight: 700;
-        }
-
         .card {
-          margin-top: 16px;
-          background: #fff;
-          border: 1px solid #e5e7eb;
-          border-radius: 16px;
+          border: 1px solid #e7e7e7;
+          border-radius: 14px;
           overflow: hidden;
+          background: white;
         }
-        .tableHead {
-          display: grid;
-          grid-template-columns: 1.2fr 0.9fr 1.2fr 1fr;
-          gap: 12px;
-          padding: 12px 14px;
-          background: #f9fafb;
-          font-weight: 800;
+        table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+        th, td {
+          padding: 10px;
+          border-top: 1px solid #eee;
+          vertical-align: middle;
+        }
+        th {
+          text-align: left;
           font-size: 13px;
-          border-bottom: 1px solid #e5e7eb;
-        }
-        .row {
-          display: grid;
-          grid-template-columns: 1.2fr 0.9fr 1.2fr 1fr;
-          gap: 12px;
-          padding: 12px 14px;
-          align-items: center;
-          border-bottom: 1px solid #f1f5f9;
-        }
-        .row:last-child {
-          border-bottom: 0;
+          color: #444;
+          background: #fafafa;
+          border-top: 0;
         }
         .storeCode {
-          font-weight: 900;
-          font-size: 18px;
-          letter-spacing: 0.02em;
+          font-weight: 800;
+          letter-spacing: 0.5px;
         }
-        .storeName {
-          font-size: 12px;
-          color: #6b7280;
-          margin-top: 2px;
-        }
-        .metal {
-          font-weight: 900;
-          font-size: 18px;
-        }
-        .statusPill {
-          font-weight: 900;
-          border: 0;
-          width: 100%;
-        }
-        .pickerInput {
-          width: 100%;
-        }
-        .leftBar {
-          width: 6px;
+        .pill {
+          display: inline-block;
+          padding: 4px 10px;
           border-radius: 999px;
-          height: 100%;
+          background: #f2f2f2;
+          font-size: 13px;
         }
-        .rowWrap {
-          display: grid;
-          grid-template-columns: 8px 1fr;
-          gap: 10px;
+        .input, .select {
+          width: 100%;
+          max-width: 260px;
+          padding: 10px;
+          border-radius: 12px;
+          border: 1px solid #cfcfcf;
+          background: white;
         }
-
-        .error {
-          margin-top: 12px;
-          background: #fff1f2;
-          border: 1px solid #fecdd3;
-          color: #9f1239;
+        .select { max-width: 220px; }
+        .logout {
           padding: 10px 12px;
           border-radius: 12px;
+          border: 1px solid #ddd;
+          background: #f6f6f6;
           font-weight: 700;
         }
 
-        /* ✅ Mobile: maak er “cards” van (iPhone fix) */
-        @media (max-width: 640px) {
-          .card {
-            border-radius: 18px;
+        /* Mobile layout: table -> cards */
+        @media (max-width: 720px) {
+          h1 { font-size: 40px !important; line-height: 1.02; }
+          .input, .select { max-width: none; }
+          table, thead, tbody, th, td, tr { display: block; }
+          thead { display: none; }
+          tr {
+            border-top: 1px solid #eee;
+            padding: 10px;
           }
-          .tableHead {
-            display: none;
-          }
-          .row {
-            grid-template-columns: 1fr;
-            gap: 10px;
-            padding: 12px 12px;
-          }
-          .rowWrap {
-            grid-template-columns: 6px 1fr;
-            gap: 10px;
-          }
-          .storeCode {
-            font-size: 20px;
-          }
-          .metal {
-            font-size: 18px;
-          }
-          .grid2 {
+          td { border: 0; padding: 6px 0; }
+          .rowGrid {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 10px;
+            gap: 8px 10px;
+            align-items: center;
           }
+          .rowGrid .full { grid-column: 1 / -1; }
+          .storeCode { font-size: 18px; }
         }
       `}</style>
 
       <div className="topbar">
         <div>
-          <h1>{title}</h1>
-          <div className="sub">
-            Klaar: {doneCount} / {totalCount}
-            {loading ? " • Laden…" : ""}
+          <h1 style={{ margin: 0, fontSize: 56 }}>{nlTitle(weekday, runDate)}</h1>
+          <div style={{ marginTop: 6, color: "#444" }}>
+            <span className="pill">Klaar: {klaarCount} / {totalCount}</span>
+            {loading ? <span style={{ marginLeft: 10, color: "#666" }}>Laden…</span> : null}
+            {info ? <span style={{ marginLeft: 10, color: "crimson" }}>{info}</span> : null}
           </div>
         </div>
 
-        <div className="controls">
-          {session && (
-            <>
-              <div className="ctrl">
-                <label>Datum</label>
-                <input
-                  type="date"
-                  value={runDate}
-                  onChange={(e) => setRunDate(e.target.value)}
-                />
-              </div>
-
-              <div className="ctrl">
-                <label>Picking dag</label>
-                <select value={weekday} onChange={(e) => setWeekday(Number(e.target.value))}>
-                  {DAY_OPTIONS.map((d) => (
-                    <option key={d.weekday} value={d.weekday}>
-                      {d.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <button className="btnSecondary" onClick={logout}>
-                Logout
-              </button>
-            </>
-          )}
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <button className="logout" onClick={signOut}>Logout</button>
         </div>
       </div>
 
-      {error && <div className="error">{error}</div>}
+      <div className="filters" style={{ marginTop: 14 }}>
+        <label style={{ fontWeight: 700 }}>Datum</label>
+        <input
+          type="date"
+          value={runDate}
+          onChange={(e) => setRunDate(e.target.value)}
+          className="input"
+          style={{ maxWidth: 180 }}
+        />
 
-      {/* LOGIN */}
-      {!checkingSession && !session && (
-        <div className="card" style={{ padding: 14 }}>
-          <div style={{ fontWeight: 900, fontSize: 18, marginBottom: 10 }}>Login</div>
+        <label style={{ fontWeight: 700 }}>Picking dag</label>
+        <select value={weekday} onChange={(e) => setWeekday(Number(e.target.value))} className="select">
+          {WEEKDAYS.map((w) => (
+            <option key={w.value} value={w.value}>
+              {w.label}
+            </option>
+          ))}
+        </select>
+      </div>
 
-          <div className="grid2">
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <label>E-mail</label>
-              <input
-                type="email"
-                value={email}
-                placeholder="algemeen@..."
-                onChange={(e) => setEmail(e.target.value)}
-              />
-            </div>
+      <div className="card" style={{ marginTop: 14 }}>
+        <table>
+          <thead>
+            <tr>
+              <th style={{ width: 180 }}>Winkel</th>
+              <th style={{ width: 140 }}>Metaal</th>
+              <th>Picker</th>
+              <th style={{ width: 220 }}>Status</th>
+            </tr>
+          </thead>
 
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <label>Wachtwoord</label>
-              <input
-                type="password"
-                value={password}
-                placeholder="••••••••"
-                onChange={(e) => setPassword(e.target.value)}
-              />
-            </div>
-          </div>
+          <tbody>
+            {lines.length === 0 ? (
+              <tr>
+                <td colSpan={4} style={{ padding: 16, color: "#666" }}>
+                  Geen winkels. (Check template voor deze picking dag.)
+                </td>
+              </tr>
+            ) : (
+              lines.map((l) => {
+                const code = l.stores?.code ?? "";
+                const bg = rowBg(l.status);
+                const saving = !!savingIds[l.id];
 
-          <div style={{ marginTop: 12, display: "flex", gap: 10, alignItems: "center" }}>
-            <button className="btn" onClick={login} disabled={loginBusy || !email || !password}>
-              {loginBusy ? "Bezig…" : "Inloggen"}
-            </button>
-          </div>
-        </div>
-      )}
+                return (
+                  <tr key={l.id} style={{ background: bg }}>
+                    {/* Desktop cells */}
+                    <td>
+                      <span className="storeCode">{code}</span>
+                    </td>
+                    <td style={{ fontWeight: 800 }}>{l.metal}</td>
+                    <td>
+                      <input
+                        className="input"
+                        value={l.picker ?? ""}
+                        placeholder="Picker"
+                        onChange={(e) => queueSave(l.id, { picker: e.target.value })}
+                        style={{ opacity: saving ? 0.65 : 1 }}
+                      />
+                    </td>
+                    <td>
+                      <select
+                        className="select"
+                        value={l.status}
+                        onChange={(e) => queueSave(l.id, { status: e.target.value as Status })}
+                        style={{ opacity: saving ? 0.65 : 1 }}
+                      >
+                        <option value="TE_DOEN">Te doen</option>
+                        <option value="BEZIG">Bezig</option>
+                        <option value="KLAAR">Klaar</option>
+                      </select>
 
-      {/* LIST */}
-      {session && (
-        <div className="card">
-          <div className="tableHead">
-            <div>Winkel</div>
-            <div>Metaal</div>
-            <div>Picker</div>
-            <div>Status</div>
-          </div>
+                      {/* Mobile extra layout helper */}
+                      <div className="rowGrid" style={{ display: "none" }}>
+                        {/* blijft leeg; alleen voor media-query block layout */}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
 
-          {lines.length === 0 && !loading && (
-            <div style={{ padding: 14, color: "#6b7280" }}>
-              Geen winkels voor deze combinatie. (Controleer picking templates voor deze dag.)
-            </div>
-          )}
-
-          {lines.map((l) => {
-            const code = l.stores?.code ?? "";
-            const name = l.stores?.name ?? "";
-            return (
-              <div key={l.id} className="rowWrap">
-                <div className="leftBar" style={{ background: STATUS_LEFT[l.status] }} />
-                <div
-                  className="row"
-                  style={{
-                    background:
-                      l.status === "TE_DOEN" ? "#fff" : STATUS_BG[l.status],
-                    borderRadius: 12,
-                  }}
-                >
-                  <div>
-                    {/* ✅ enkel code groot, naam klein (geen CIT—CIT) */}
-                    <div className="storeCode">{code}</div>
-                    <div className="storeName">{name}</div>
-                  </div>
-
-                  <div className="metal">{l.metal}</div>
-
-                  <div>
-                    <input
-                      className="pickerInput"
-                      type="text"
-                      value={l.picker ?? ""}
-                      placeholder="Picker"
-                      onChange={(e) => queueSave(l.id, { picker: e.target.value })}
-                    />
-                  </div>
-
-                  <div>
-                    <select
-                      className="statusPill"
-                      value={l.status}
-                      onChange={(e) => queueSave(l.id, { status: e.target.value as Status })}
-                      style={{
-                        background: l.status === "TE_DOEN" ? "#fff" : STATUS_BG[l.status],
-                        border: "1px solid #d1d5db",
-                        padding: "10px 12px",
-                        borderRadius: 12,
-                      }}
-                    >
-                      <option value="TE_DOEN">Te doen</option>
-                      <option value="BEZIG">Bezig</option>
-                      <option value="KLAAR">Klaar</option>
-                    </select>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
+      <div style={{ marginTop: 10, color: "#666", fontSize: 13 }}>
+        Tip: status <b>Bezig</b> = rood, <b>Klaar</b> = groen. Alles wordt automatisch opgeslagen.
+      </div>
     </div>
   );
 }
