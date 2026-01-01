@@ -1,22 +1,26 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { createClient, Session } from "@supabase/supabase-js";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { createClient, type Session } from "@supabase/supabase-js";
+
+type Status = "TE_DOEN" | "BEZIG" | "KLAAR";
+type Metal = "ZILVER" | "STAAL";
 
 type Store = {
   id: string;
   code: string;
   name: string;
-  active?: boolean | null;
+  active?: boolean;
 };
 
-type PickingLine = {
+type Line = {
   id: string;
   run_id: string;
   store_id: string;
-  metal: "ZILVER" | "STAAL";
+  metal: Metal;
   picker: string | null;
-  status: "TE_DOEN" | "BEZIG" | "KLAAR";
+  status: Status;
+  stores?: { code: string; name: string } | null;
 };
 
 const supabase = createClient(
@@ -29,343 +33,609 @@ const DAY_OPTIONS = [
   { label: "Woensdag", weekday: 3 },
   { label: "Donderdag", weekday: 4 },
   { label: "Vrijdag", weekday: 5 },
-];
+] as const;
 
-const STATUS_BG: Record<PickingLine["status"], string> = {
+const STATUS_BG: Record<Status, string> = {
   TE_DOEN: "#ffffff",
-  BEZIG: "#ff7a7a", // duidelijker rood
-  KLAAR: "#7dff9b", // duidelijker groen
+  BEZIG: "#ff6b6b", // duidelijker rood
+  KLAAR: "#3ddc84", // duidelijker groen
 };
 
-const STATUS_LEFT: Record<PickingLine["status"], string> = {
-  TE_DOEN: "#e6e6e6",
-  BEZIG: "#c70000",
-  KLAAR: "#0b7a2a",
+const STATUS_LEFT: Record<Status, string> = {
+  TE_DOEN: "#e5e7eb",
+  BEZIG: "#e11d48",
+  KLAAR: "#16a34a",
 };
 
-function toISODate(d: Date) {
-  return new Date(d.getTime() - d.getTimezoneOffset() * 60000)
-    .toISOString()
-    .slice(0, 10);
+function isoDate(d: Date) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const da = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${da}`;
 }
 
-function weekdayLabel(w: number) {
-  return DAY_OPTIONS.find((d) => d.weekday === w)?.label ?? "";
+function dayLabelFromWeekday(weekday: number) {
+  return DAY_OPTIONS.find((d) => d.weekday === weekday)?.label ?? "Onbekend";
+}
+
+async function postJSON<T>(url: string, body: any): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
+  }
+  return data as T;
 }
 
 export default function Home() {
-  /* =======================
-     AUTH (1 algemene login)
-     ======================= */
+  // ⚠️ Geen conditionele hooks (iPhone/React hook order issues vermijden)
   const [session, setSession] = useState<Session | null>(null);
+  const [checkingSession, setCheckingSession] = useState(true);
+
+  // Login form
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [authLoading, setAuthLoading] = useState(false);
+  const [loginBusy, setLoginBusy] = useState(false);
 
-  /* =======================
-     APP STATE
-     ======================= */
-  const [mounted, setMounted] = useState(false);
-  const [runDate, setRunDate] = useState("");
-  const [weekday, setWeekday] = useState(2);
+  // App state
+  const [runDate, setRunDate] = useState<string>(() => isoDate(new Date()));
+  const [weekday, setWeekday] = useState<number>(() => {
+    // default: huidige dag -> als weekend/maandag, neem dinsdag
+    const jsDay = new Date().getDay(); // 0=zo..6=za
+    const map: Record<number, number> = { 0: 2, 1: 2, 2: 2, 3: 3, 4: 4, 5: 5, 6: 2 };
+    return map[jsDay] ?? 2;
+  });
+
   const [loading, setLoading] = useState(false);
-  const [stores, setStores] = useState<Store[]>([]);
-  const [lines, setLines] = useState<PickingLine[]>([]);
+  const [lines, setLines] = useState<Line[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [runId, setRunId] = useState<string | null>(null);
+
+  // debounce save queue (minder spam)
   const saveTimers = useRef<Record<string, any>>({});
 
-  /* =======================
-     AUTH INIT
-     ======================= */
+  const doneCount = useMemo(() => lines.filter((l) => l.status === "KLAAR").length, [lines]);
+  const totalCount = useMemo(() => lines.length, [lines]);
+
+  // ---- Session init
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
+    let mounted = true;
+
+    (async () => {
+      try {
+        const { data } = await supabase.auth.getSession();
+        if (!mounted) return;
+        setSession(data.session ?? null);
+      } finally {
+        if (mounted) setCheckingSession(false);
+      }
+    })();
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => {
+      setSession(s);
     });
 
-    const { data: listener } = supabase.auth.onAuthStateChange(
-      (_event, session) => {
-        setSession(session);
-      }
-    );
-
     return () => {
-      listener.subscription.unsubscribe();
+      mounted = false;
+      sub.subscription.unsubscribe();
     };
   }, []);
 
   async function login() {
-    setAuthLoading(true);
-    const { error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
-    setAuthLoading(false);
-    if (error) alert(error.message);
+    setLoginBusy(true);
+    setError(null);
+    try {
+      const { error: e } = await supabase.auth.signInWithPassword({ email, password });
+      if (e) throw e;
+    } catch (e: any) {
+      setError(e?.message ?? "Login mislukt");
+    } finally {
+      setLoginBusy(false);
+    }
   }
 
   async function logout() {
     await supabase.auth.signOut();
-    setSession(null);
+    setLines([]);
+    setRunId(null);
   }
 
-  const doneCount = lines.filter((l) => l.status === "KLAAR").length;
-
-  const linesByStore = useMemo(() => {
-    const m = new Map<string, PickingLine[]>();
-    for (const l of lines) {
-      const arr = m.get(l.store_id) ?? [];
-      arr.push(l);
-      m.set(l.store_id, arr);
-    }
-    // (optioneel) sorteer per metaal zodat ZILVER altijd boven STAAL staat
-    for (const [k, arr] of m.entries()) {
-      arr.sort((a, b) => (a.metal > b.metal ? 1 : -1));
-      m.set(k, arr);
-    }
-    return m;
-  }, [lines]);
-
-  async function ensureRunId(dateISO: string, wd: number): Promise<string> {
-    // 1) bestáát run al?
-    const { data: existing, error: e1 } = await supabase
-      .from("picking_runs")
-      .select("id")
-      .eq("run_date", dateISO)
-      .maybeSingle();
-
-    if (e1) throw e1;
-    if (existing?.id) return existing.id;
-
-    // 2) anders: maak run aan (zodat TS + Vercel niet klagen en app altijd werkt)
-    const { data: created, error: e2 } = await supabase
-      .from("picking_runs")
-      .insert({
-        run_date: dateISO,
-        day_name: weekdayLabel(wd),
-      })
-      .select("id")
-      .single();
-
-    if (e2) throw e2;
-    if (!created?.id) throw new Error("Kon picking_run niet aanmaken.");
-    return created.id;
-  }
-
-  async function loadAll(dateISO: string, wd: number) {
+  // ---- Load data (runs/templates/lines)
+  async function loadAll(dateStr: string, weekdayNum: number) {
     setLoading(true);
-    try {
-      const runId = await ensureRunId(dateISO, wd);
+    setError(null);
 
-      // template winkels voor gekozen weekdag
-      const { data: templ, error: tErr } = await supabase
+    try {
+      // 1) run ophalen of maken op run_date
+      const { data: existingRun, error: runSelErr } = await supabase
+        .from("picking_runs")
+        .select("id")
+        .eq("run_date", dateStr)
+        .maybeSingle();
+
+      if (runSelErr) throw runSelErr;
+
+      let rid = existingRun?.id as string | undefined;
+
+      if (!rid) {
+        const { data: createdRun, error: runInsErr } = await supabase
+          .from("picking_runs")
+          .insert([{ run_date: dateStr, day_name: dayLabelFromWeekday(weekdayNum) }])
+          .select("id")
+          .single();
+
+        if (runInsErr) throw runInsErr;
+        rid = createdRun?.id;
+      }
+
+      if (!rid) throw new Error("Kon run niet maken/ophalen");
+      setRunId(rid);
+
+      // 2) templates voor die weekday -> store_id’s
+      const { data: templ, error: templErr } = await supabase
         .from("picking_templates")
         .select("store_id")
-        .eq("weekday", wd);
+        .eq("weekday", weekdayNum);
 
-      if (tErr) throw tErr;
+      if (templErr) throw templErr;
 
-      const storeIds = templ?.map((t) => t.store_id) ?? [];
-      if (!storeIds.length) {
-        setStores([]);
+      const storeIds = (templ ?? []).map((t: any) => t.store_id).filter(Boolean);
+
+      if (storeIds.length === 0) {
         setLines([]);
         return;
       }
 
-      // stores ophalen (inclusief active om TS errors op Vercel te vermijden)
-      const { data: storeRows, error: sErr } = await supabase
+      // 3) stores ophalen
+      const { data: storeRows, error: storesErr } = await supabase
         .from("stores")
-        .select("id,code,name,active")
+        .select("id, code, name, active")
         .in("id", storeIds);
 
-      if (sErr) throw sErr;
+      if (storesErr) throw storesErr;
 
-      const safeStores: Store[] = (storeRows ?? []).map((s: any) => ({
+      const stores: Store[] = (storeRows ?? []).map((s: any) => ({
         id: s.id,
         code: s.code,
         name: s.name,
-        active: s.active ?? null,
+        active: s.active,
       }));
 
-      setStores(safeStores);
-
-      // zorg dat er voor elke store 2 lijnen bestaan (ZILVER + STAAL)
-      const base = safeStores.flatMap((s) => [
-        { run_id: runId, store_id: s.id, metal: "ZILVER", status: "TE_DOEN" as const },
-        { run_id: runId, store_id: s.id, metal: "STAAL", status: "TE_DOEN" as const },
-      ]);
-
-      // Belangrijk: dit werkt alleen als je UNIQUE hebt op (run_id, store_id, metal)
-      const { error: upErr } = await supabase
+      // 4) bestaande lijnen ophalen
+      const { data: existingLines, error: linesErr } = await supabase
         .from("picking_lines")
-        .upsert(base, { onConflict: "run_id,store_id,metal" });
+        .select("id, run_id, store_id, metal, picker, status")
+        .eq("run_id", rid)
+        .in("store_id", storeIds);
 
-      if (upErr) throw upErr;
+      if (linesErr) throw linesErr;
 
-      const { data: lineRows, error: lErr } = await supabase
+      // 5) missing lines aanmaken (per store: ZILVER + STAAL)
+      const need: { run_id: string; store_id: string; metal: Metal; status: Status }[] = [];
+      const key = (a: { store_id: string; metal: string }) => `${a.store_id}__${a.metal}`;
+      const existingSet = new Set((existingLines ?? []).map((l: any) => key(l)));
+
+      for (const s of stores) {
+        for (const metal of ["ZILVER", "STAAL"] as Metal[]) {
+          const k = `${s.id}__${metal}`;
+          if (!existingSet.has(k)) {
+            need.push({ run_id: rid, store_id: s.id, metal, status: "TE_DOEN" });
+          }
+        }
+      }
+
+      if (need.length > 0) {
+        // Als je constraint op (run_id, store_id, metal) staat: dit werkt perfect.
+        // Anders: laat me weten en ik pas dit aan naar jouw exacte constraint.
+        const { error: insErr } = await supabase
+          .from("picking_lines")
+          .upsert(need, { onConflict: "run_id,store_id,metal" });
+
+        if (insErr) throw insErr;
+      }
+
+      // 6) finale lijst ophalen met store info
+      const { data: finalLines, error: finalErr } = await supabase
         .from("picking_lines")
-        .select("*")
-        .eq("run_id", runId);
+        .select("id, run_id, store_id, metal, picker, status, stores(code,name)")
+        .eq("run_id", rid)
+        .in("store_id", storeIds);
 
-      if (lErr) throw lErr;
+      if (finalErr) throw finalErr;
 
-      setLines((lineRows ?? []) as PickingLine[]);
+      const sorted = (finalLines ?? []) as Line[];
+      sorted.sort((a, b) => {
+        const ac = a.stores?.code ?? "";
+        const bc = b.stores?.code ?? "";
+        if (ac !== bc) return ac.localeCompare(bc);
+        // STAAL eerst? of ZILVER eerst? (nu STAAL bovenaan)
+        const am = a.metal === "STAAL" ? 0 : 1;
+        const bm = b.metal === "STAAL" ? 0 : 1;
+        return am - bm;
+      });
+
+      setLines(sorted);
+    } catch (e: any) {
+      setError(e?.message ?? "Fout bij laden");
+      setLines([]);
+      setRunId(null);
     } finally {
       setLoading(false);
     }
   }
 
-  function queueSave(id: string, patch: Partial<PickingLine>) {
-    setLines((l) => l.map((x) => (x.id === id ? { ...x, ...patch } : x)));
+  // load bij wijziging datum/dag (maar enkel als ingelogd)
+  useEffect(() => {
+    if (!session) return;
+    loadAll(runDate, weekday);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session, runDate, weekday]);
 
-    clearTimeout(saveTimers.current[id]);
-    saveTimers.current[id] = setTimeout(async () => {
-      const { error } = await supabase.from("picking_lines").update(patch).eq("id", id);
-      if (error) console.error(error);
+  function queueSave(lineId: string, patch: Partial<Pick<Line, "picker" | "status">>) {
+    // optimistisch updaten in UI
+    setLines((prev) =>
+      prev.map((l) => (l.id === lineId ? ({ ...l, ...patch } as Line) : l))
+    );
+
+    if (saveTimers.current[lineId]) clearTimeout(saveTimers.current[lineId]);
+
+    saveTimers.current[lineId] = setTimeout(async () => {
+      try {
+        // ✅ Server-side update met service role (geen RLS/audit problemen)
+        await postJSON<{ ok: true }>("/api/update-line", { id: lineId, patch });
+      } catch (e: any) {
+        setError(e?.message ?? "Opslaan mislukt");
+        // herladen om terug consistent te worden
+        if (runId) loadAll(runDate, weekday);
+      }
     }, 250);
   }
 
-  useEffect(() => {
-    setMounted(true);
-    setRunDate(toISODate(new Date()));
-  }, []);
+  // UI helpers
+  const title = useMemo(() => {
+    const d = new Date(runDate + "T00:00:00");
+    const day = DAY_OPTIONS.find((x) => x.weekday === weekday)?.label ?? "Picking";
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const da = String(d.getDate()).padStart(2, "0");
+    return `Picking — ${day} ${y}-${m}-${da}`;
+  }, [runDate, weekday]);
 
-  useEffect(() => {
-    if (mounted && session && runDate) {
-      loadAll(runDate, weekday).catch((e) => {
-        console.error(e);
-        alert(e?.message ?? "Fout bij laden");
-      });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mounted, session, runDate, weekday]);
-
-  if (!mounted) return <div style={{ padding: 20 }}>Laden…</div>;
-
-  /* =======================
-     LOGIN SCHERM
-     ======================= */
-  if (!session) {
-    return (
-      <div style={{ maxWidth: 360, margin: "80px auto", padding: 20 }}>
-        <h2 style={{ marginBottom: 12 }}>Picking login</h2>
-
-        <input
-          placeholder="Email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          style={{ width: "100%", padding: 12, marginBottom: 10 }}
-        />
-        <input
-          type="password"
-          placeholder="Wachtwoord"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          style={{ width: "100%", padding: 12, marginBottom: 12 }}
-        />
-
-        <button
-          onClick={login}
-          disabled={authLoading}
-          style={{ padding: "10px 14px", width: "100%" }}
-        >
-          {authLoading ? "Inloggen…" : "Login"}
-        </button>
-      </div>
-    );
-  }
-
-  /* =======================
-     APP
-     ======================= */
+  // ---- Render
   return (
-    <div style={{ padding: 16, maxWidth: 1100, margin: "0 auto" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+    <div className="wrap">
+      <style jsx>{`
+        .wrap {
+          max-width: 980px;
+          margin: 0 auto;
+          padding: 16px;
+          font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+          color: #111827;
+        }
+        .topbar {
+          display: flex;
+          justify-content: space-between;
+          gap: 12px;
+          align-items: flex-start;
+          flex-wrap: wrap;
+        }
+        h1 {
+          margin: 0;
+          font-size: clamp(28px, 5vw, 44px);
+          line-height: 1.05;
+          letter-spacing: -0.02em;
+        }
+        .sub {
+          margin-top: 8px;
+          color: #374151;
+          font-size: 14px;
+        }
+        .controls {
+          display: flex;
+          gap: 12px;
+          align-items: center;
+          flex-wrap: wrap;
+          justify-content: flex-end;
+        }
+        .ctrl {
+          display: flex;
+          gap: 8px;
+          align-items: center;
+          background: #f3f4f6;
+          padding: 10px 12px;
+          border-radius: 14px;
+        }
+        label {
+          font-size: 13px;
+          color: #111827;
+          font-weight: 600;
+          white-space: nowrap;
+        }
+        input[type="date"],
+        select,
+        input[type="text"],
+        input[type="email"],
+        input[type="password"] {
+          font-size: 16px; /* iOS zoom fix */
+          padding: 10px 12px;
+          border-radius: 12px;
+          border: 1px solid #d1d5db;
+          background: #fff;
+          outline: none;
+        }
+        .btn {
+          border: 0;
+          background: #111827;
+          color: #fff;
+          padding: 10px 14px;
+          border-radius: 12px;
+          font-weight: 700;
+        }
+        .btn:disabled {
+          opacity: 0.6;
+        }
+        .btnSecondary {
+          border: 1px solid #d1d5db;
+          background: #fff;
+          color: #111827;
+          padding: 10px 14px;
+          border-radius: 12px;
+          font-weight: 700;
+        }
+
+        .card {
+          margin-top: 16px;
+          background: #fff;
+          border: 1px solid #e5e7eb;
+          border-radius: 16px;
+          overflow: hidden;
+        }
+        .tableHead {
+          display: grid;
+          grid-template-columns: 1.2fr 0.9fr 1.2fr 1fr;
+          gap: 12px;
+          padding: 12px 14px;
+          background: #f9fafb;
+          font-weight: 800;
+          font-size: 13px;
+          border-bottom: 1px solid #e5e7eb;
+        }
+        .row {
+          display: grid;
+          grid-template-columns: 1.2fr 0.9fr 1.2fr 1fr;
+          gap: 12px;
+          padding: 12px 14px;
+          align-items: center;
+          border-bottom: 1px solid #f1f5f9;
+        }
+        .row:last-child {
+          border-bottom: 0;
+        }
+        .storeCode {
+          font-weight: 900;
+          font-size: 18px;
+          letter-spacing: 0.02em;
+        }
+        .storeName {
+          font-size: 12px;
+          color: #6b7280;
+          margin-top: 2px;
+        }
+        .metal {
+          font-weight: 900;
+          font-size: 18px;
+        }
+        .statusPill {
+          font-weight: 900;
+          border: 0;
+          width: 100%;
+        }
+        .pickerInput {
+          width: 100%;
+        }
+        .leftBar {
+          width: 6px;
+          border-radius: 999px;
+          height: 100%;
+        }
+        .rowWrap {
+          display: grid;
+          grid-template-columns: 8px 1fr;
+          gap: 10px;
+        }
+
+        .error {
+          margin-top: 12px;
+          background: #fff1f2;
+          border: 1px solid #fecdd3;
+          color: #9f1239;
+          padding: 10px 12px;
+          border-radius: 12px;
+          font-weight: 700;
+        }
+
+        /* ✅ Mobile: maak er “cards” van (iPhone fix) */
+        @media (max-width: 640px) {
+          .card {
+            border-radius: 18px;
+          }
+          .tableHead {
+            display: none;
+          }
+          .row {
+            grid-template-columns: 1fr;
+            gap: 10px;
+            padding: 12px 12px;
+          }
+          .rowWrap {
+            grid-template-columns: 6px 1fr;
+            gap: 10px;
+          }
+          .storeCode {
+            font-size: 20px;
+          }
+          .metal {
+            font-size: 18px;
+          }
+          .grid2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+          }
+        }
+      `}</style>
+
+      <div className="topbar">
         <div>
-          <h1 style={{ margin: 0 }}>
-            Picking – {weekdayLabel(weekday)} {runDate}
-          </h1>
-          <div style={{ marginTop: 6 }}>
-            Klaar: {doneCount} / {lines.length} {loading ? "• Laden…" : ""}
+          <h1>{title}</h1>
+          <div className="sub">
+            Klaar: {doneCount} / {totalCount}
+            {loading ? " • Laden…" : ""}
           </div>
         </div>
 
-        <button onClick={logout} style={{ height: 40 }}>
-          Logout
-        </button>
-      </div>
+        <div className="controls">
+          {session && (
+            <>
+              <div className="ctrl">
+                <label>Datum</label>
+                <input
+                  type="date"
+                  value={runDate}
+                  onChange={(e) => setRunDate(e.target.value)}
+                />
+              </div>
 
-      <div style={{ margin: "12px 0", display: "flex", gap: 12, flexWrap: "wrap" }}>
-        <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          Datum
-          <input
-            type="date"
-            value={runDate}
-            onChange={(e) => setRunDate(e.target.value)}
-            style={{ padding: 8 }}
-          />
-        </label>
+              <div className="ctrl">
+                <label>Picking dag</label>
+                <select value={weekday} onChange={(e) => setWeekday(Number(e.target.value))}>
+                  {DAY_OPTIONS.map((d) => (
+                    <option key={d.weekday} value={d.weekday}>
+                      {d.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-        <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          Picking dag
-          <select
-            value={weekday}
-            onChange={(e) => setWeekday(Number(e.target.value))}
-            style={{ padding: 8, minWidth: 160 }}
-          >
-            {DAY_OPTIONS.map((d) => (
-              <option key={d.weekday} value={d.weekday}>
-                {d.label}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-
-      {stores.length === 0 ? (
-        <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
-          Geen winkels voor deze picking dag.
+              <button className="btnSecondary" onClick={logout}>
+                Logout
+              </button>
+            </>
+          )}
         </div>
-      ) : (
-        stores.map((s) => {
-          const ls = linesByStore.get(s.id) ?? [];
-          return ls.map((l) => (
-            <div
-              key={l.id}
-              style={{
-                display: "grid",
-                gridTemplateColumns: "140px 120px 1fr 180px",
-                gap: 10,
-                padding: 12,
-                marginBottom: 8,
-                background: STATUS_BG[l.status],
-                borderLeft: `8px solid ${STATUS_LEFT[l.status]}`,
-                borderRadius: 8,
-                alignItems: "center",
-              }}
-            >
-              {/* enkel code zoals jij wil: CIT */}
-              <strong style={{ fontSize: 16 }}>{s.code}</strong>
+      </div>
 
-              <strong style={{ fontSize: 16 }}>{l.metal}</strong>
+      {error && <div className="error">{error}</div>}
 
+      {/* LOGIN */}
+      {!checkingSession && !session && (
+        <div className="card" style={{ padding: 14 }}>
+          <div style={{ fontWeight: 900, fontSize: 18, marginBottom: 10 }}>Login</div>
+
+          <div className="grid2">
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <label>E-mail</label>
               <input
-                value={l.picker ?? ""}
-                placeholder="Picker"
-                onChange={(e) => queueSave(l.id, { picker: e.target.value })}
-                style={{ padding: 10, borderRadius: 10, border: "1px solid #bbb" }}
+                type="email"
+                value={email}
+                placeholder="algemeen@..."
+                onChange={(e) => setEmail(e.target.value)}
               />
-
-              <select
-                value={l.status}
-                onChange={(e) => queueSave(l.id, { status: e.target.value as any })}
-                style={{ padding: 10, borderRadius: 10, border: "1px solid #bbb" }}
-              >
-                <option value="TE_DOEN">Te doen</option>
-                <option value="BEZIG">Bezig</option>
-                <option value="KLAAR">Klaar</option>
-              </select>
             </div>
-          ));
-        })
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <label>Wachtwoord</label>
+              <input
+                type="password"
+                value={password}
+                placeholder="••••••••"
+                onChange={(e) => setPassword(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div style={{ marginTop: 12, display: "flex", gap: 10, alignItems: "center" }}>
+            <button className="btn" onClick={login} disabled={loginBusy || !email || !password}>
+              {loginBusy ? "Bezig…" : "Inloggen"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* LIST */}
+      {session && (
+        <div className="card">
+          <div className="tableHead">
+            <div>Winkel</div>
+            <div>Metaal</div>
+            <div>Picker</div>
+            <div>Status</div>
+          </div>
+
+          {lines.length === 0 && !loading && (
+            <div style={{ padding: 14, color: "#6b7280" }}>
+              Geen winkels voor deze combinatie. (Controleer picking templates voor deze dag.)
+            </div>
+          )}
+
+          {lines.map((l) => {
+            const code = l.stores?.code ?? "";
+            const name = l.stores?.name ?? "";
+            return (
+              <div key={l.id} className="rowWrap">
+                <div className="leftBar" style={{ background: STATUS_LEFT[l.status] }} />
+                <div
+                  className="row"
+                  style={{
+                    background:
+                      l.status === "TE_DOEN" ? "#fff" : STATUS_BG[l.status],
+                    borderRadius: 12,
+                  }}
+                >
+                  <div>
+                    {/* ✅ enkel code groot, naam klein (geen CIT—CIT) */}
+                    <div className="storeCode">{code}</div>
+                    <div className="storeName">{name}</div>
+                  </div>
+
+                  <div className="metal">{l.metal}</div>
+
+                  <div>
+                    <input
+                      className="pickerInput"
+                      type="text"
+                      value={l.picker ?? ""}
+                      placeholder="Picker"
+                      onChange={(e) => queueSave(l.id, { picker: e.target.value })}
+                    />
+                  </div>
+
+                  <div>
+                    <select
+                      className="statusPill"
+                      value={l.status}
+                      onChange={(e) => queueSave(l.id, { status: e.target.value as Status })}
+                      style={{
+                        background: l.status === "TE_DOEN" ? "#fff" : STATUS_BG[l.status],
+                        border: "1px solid #d1d5db",
+                        padding: "10px 12px",
+                        borderRadius: 12,
+                      }}
+                    >
+                      <option value="TE_DOEN">Te doen</option>
+                      <option value="BEZIG">Bezig</option>
+                      <option value="KLAAR">Klaar</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
       )}
     </div>
   );
