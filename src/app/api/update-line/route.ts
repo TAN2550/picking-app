@@ -3,17 +3,17 @@ import { supabaseServer } from "@/lib/supabase/server";
 
 export async function POST(req: Request) {
   try {
-    const supabase = supabaseServer();
-    const body = await req.json();
+    // ✅ bij jou is supabaseServer async
+    const supabase = await supabaseServer();
 
-    // verwacht: { id: "uuid", patch: { picker?: string, status?: string } }
+    const body = await req.json();
     const { id, patch } = body ?? {};
 
     if (!id || !patch || typeof patch !== "object") {
       return NextResponse.json({ error: "Bad request" }, { status: 400 });
     }
 
-    // 1) Update picking line (dit is het belangrijkste)
+    // 1) Update picking line (belangrijkste)
     const { data: updated, error: updErr } = await supabase
       .from("picking_lines")
       .update(patch)
@@ -28,12 +28,9 @@ export async function POST(req: Request) {
       );
     }
 
-    // 2) Audit proberen, maar NOOIT de app laten crashen
-    // (als RLS niet goed staat, vangen we dat op)
+    // 2) Audit proberen, maar nooit crashen
     let auditWarning: any = null;
     try {
-      // Minimal audit payload (werkt alleen als deze kolommen bestaan).
-      // Als jouw audit tabel andere kolommen heeft, dan faalt insert -> we vangen dat op.
       const { error: auditErr } = await supabase.from("picking_line_audit").insert({
         line_id: id,
         changed_at: new Date().toISOString(),
@@ -41,9 +38,7 @@ export async function POST(req: Request) {
         new_status: patch.status ?? null,
       } as any);
 
-      if (auditErr) {
-        auditWarning = { message: auditErr.message, code: auditErr.code };
-      }
+      if (auditErr) auditWarning = { message: auditErr.message, code: auditErr.code };
     } catch (e: any) {
       auditWarning = { message: e?.message ?? "audit failed" };
     }
