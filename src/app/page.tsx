@@ -403,9 +403,14 @@ export default function Home() {
           </div>
         </div>
 
-        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          <button className="logout" onClick={signOut}>Logout</button>
-        </div>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6 }}>
+  <button className="logout" onClick={signOut}>Logout</button>
+  <img
+    src="/logo.png"
+    alt="Twice As Nice"
+    style={{ height: 26, width: "auto", opacity: 0.95 }}
+  />
+</div>
       </div>
 
       <div className="filters" style={{ marginTop: 14 }}>
