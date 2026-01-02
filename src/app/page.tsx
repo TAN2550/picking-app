@@ -1,12 +1,24 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { supabaseBrowser } from "@/lib/supabase/client";
+import { createClient } from "@supabase/supabase-js";
+
+/** =======================
+ *  INSTELLING: kies layout
+ *  ======================= */
+// A = logo ONDER logout (stack)
+// B = logo NAAST logout (inline)
+const BRAND_MODE: "stack" | "inline" = "stack";
+
+// pas dit aan als je logo groter/kleiner wil
+const BRAND_WIDTH_PX = 140; // breedte van logo-blok (A en B)
+const LOGIN_BRAND_WIDTH_PX = 180; // breedte van logo op login
 
 type Status = "TE_DOEN" | "BEZIG" | "KLAAR";
 type Metal = "ZILVER" | "STAAL";
 
-type StoreRow = { id: string; code: string; name: string; active?: boolean };
+type StoreMini = { code: string; name: string };
+
 type LineRow = {
   id: string;
   run_id: string;
@@ -14,38 +26,46 @@ type LineRow = {
   metal: Metal;
   picker: string | null;
   status: Status;
-  stores?: { code: string; name: string } | null;
+  stores?: StoreMini | StoreMini[] | null; // supabase kan dit soms als array teruggeven
 };
 
-const WEEKDAYS: { label: string; value: number }[] = [
-  { label: "Dinsdag", value: 2 },
-  { label: "Woensdag", value: 3 },
-  { label: "Donderdag", value: 4 },
-  { label: "Vrijdag", value: 5 },
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+);
+
+const WEEKDAYS = [
+  { value: 2, label: "Dinsdag" },
+  { value: 3, label: "Woensdag" },
+  { value: 4, label: "Donderdag" },
+  { value: 5, label: "Vrijdag" },
 ];
 
-function pad2(n: number) {
-  return String(n).padStart(2, "0");
-}
 function formatLocalYYYYMMDD(d: Date) {
-  // Local date (geen UTC shift!)
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  const dt = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+  return dt.toISOString().slice(0, 10);
 }
+
 function nlTitle(weekday: number, runDate: string) {
-  const map: Record<number, string> = { 2: "Dinsdag", 3: "Woensdag", 4: "Donderdag", 5: "Vrijdag" };
-  return `Picking – ${map[weekday] ?? "Dag"} ${runDate}`;
+  const wd = WEEKDAYS.find((w) => w.value === weekday)?.label ?? "Dag";
+  return `Picking – ${wd} ${runDate}`;
 }
 
 function rowBg(status: Status) {
-  // Duidelijker rood/groen
-  if (status === "KLAAR") return "rgba(0, 160, 60, 0.30)";
-  if (status === "BEZIG") return "rgba(220, 0, 0, 0.25)";
+  if (status === "KLAAR") return "rgba(0, 160, 60, 0.20)";
+  if (status === "BEZIG") return "rgba(220, 0, 0, 0.18)";
   return "transparent";
 }
 
-export default function Home() {
-  const supabase = useMemo(() => supabaseBrowser(), []);
+function normalizeStoreCode(line: LineRow) {
+  // supabase join kan object of array geven — we vangen beide af
+  const s = line.stores as any;
+  if (!s) return "";
+  if (Array.isArray(s)) return s[0]?.code ?? "";
+  return s.code ?? "";
+}
 
+export default function Home() {
   // --- Auth / session ---
   const [session, setSession] = useState<any>(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -57,17 +77,15 @@ export default function Home() {
   // --- Picking state ---
   const [runDate, setRunDate] = useState<string>(() => formatLocalYYYYMMDD(new Date()));
   const [weekday, setWeekday] = useState<number>(() => {
-    const jsDay = new Date().getDay(); // 0..6 (zo=0)
+    const jsDay = new Date().getDay(); // zo=0
     const map: Record<number, number> = { 2: 2, 3: 3, 4: 4, 5: 5 };
-    // als weekend/maandag: default dinsdag
-    return map[jsDay] ?? 2;
+    return map[jsDay] ?? 2; // default dinsdag
   });
 
   const [loading, setLoading] = useState(false);
   const [info, setInfo] = useState<string>("");
   const [lines, setLines] = useState<LineRow[]>([]);
   const [savingIds, setSavingIds] = useState<Record<string, boolean>>({});
-
   const saveTimers = useRef<Record<string, any>>({});
 
   const klaarCount = useMemo(() => lines.filter((l) => l.status === "KLAAR").length, [lines]);
@@ -91,7 +109,7 @@ export default function Home() {
     return () => {
       if (unsub) unsub.unsubscribe();
     };
-  }, [supabase]);
+  }, []);
 
   async function signIn(e: React.FormEvent) {
     e.preventDefault();
@@ -128,10 +146,12 @@ export default function Home() {
           .select("id")
           .single();
         if (created.error) throw created.error;
-        runId = created.data.id;
+        runId = created.data?.id;
       }
 
-      // 2) template stores voor gekozen weekday
+      if (!runId) throw new Error("Geen runId gevonden/aangemaakt.");
+
+      // 2) stores voor deze picking dag (template)
       const templ = await supabase
         .from("picking_templates")
         .select("store_id")
@@ -141,80 +161,61 @@ export default function Home() {
 
       const storeIds = (templ.data ?? []).map((t: any) => t.store_id).filter(Boolean);
 
-      if (storeIds.length === 0) {
+      if (!storeIds.length) {
         setLines([]);
-        setInfo("Geen winkels in template voor deze picking dag.");
         return;
       }
 
-      // 3) existing lines?
-      const existing = await supabase
+      // 3) stores details
+      const storesRes = await supabase
+        .from("stores")
+        .select("id,code,name")
+        .in("id", storeIds);
+
+      if (storesRes.error) throw storesRes.error;
+
+      const storeRows = storesRes.data ?? [];
+
+      // 4) Zorg dat picking_lines bestaan (2 metalen per store)
+      const base = storeRows.flatMap((s: any) => [
+        { run_id: runId, store_id: s.id, metal: "ZILVER", status: "TE_DOEN" as Status },
+        { run_id: runId, store_id: s.id, metal: "STAAL", status: "TE_DOEN" as Status },
+      ]);
+
+      const up = await supabase.from("picking_lines").upsert(base, { onConflict: "run_id,store_id,metal" });
+      if (up.error) throw up.error;
+
+      // 5) Load lines + join store code/name
+      const linesRes = await supabase
         .from("picking_lines")
-        .select("id, run_id, store_id, metal, picker, status, stores(code,name)")
+        .select("id,run_id,store_id,metal,picker,status,stores:stores(code,name)")
         .eq("run_id", runId)
-        .in("store_id", storeIds);
+        .in("store_id", storeRows.map((s: any) => s.id));
 
-      if (existing.error) throw existing.error;
+      if (linesRes.error) throw linesRes.error;
 
-      if ((existing.data ?? []).length === 0) {
-        // 4) create base lines (2x per store)
-        const base = storeIds.flatMap((sid: string) => [
-          { run_id: runId, store_id: sid, metal: "ZILVER", status: "TE_DOEN" as Status },
-          { run_id: runId, store_id: sid, metal: "STAAL", status: "TE_DOEN" as Status },
-        ]);
+      const normalized = (linesRes.data ?? []) as LineRow[];
 
-        // onConflict vereist UNIQUE(run_id, store_id, metal)
-        const up = await supabase
-          .from("picking_lines")
-          .upsert(base, { onConflict: "run_id,store_id,metal" });
+      // sort by store code then metal (ZILVER boven STAAL)
+      normalized.sort((a, b) => {
+        const ac = normalizeStoreCode(a);
+        const bc = normalizeStoreCode(b);
+        const c = ac.localeCompare(bc);
+        if (c !== 0) return c;
+        return a.metal === b.metal ? 0 : a.metal === "ZILVER" ? -1 : 1;
+      });
 
-        if (up.error) throw up.error;
-
-        // reload
-        const reload = await supabase
-          .from("picking_lines")
-          .select("id, run_id, store_id, metal, picker, status, stores(code,name)")
-          .eq("run_id", runId)
-          .in("store_id", storeIds);
-
-        if (reload.error) throw reload.error;
-        setLines(sortLines(reload.data as any));
-      } else {
-        setLines(sortLines(existing.data as any));
-      }
+      setLines(normalized);
     } catch (e: any) {
-      console.error(e);
       setInfo(e?.message ?? "Fout bij laden");
     } finally {
       setLoading(false);
     }
   }
 
-  function sortLines(arr: LineRow[]) {
-    const metalOrder: Record<string, number> = { ZILVER: 0, STAAL: 1 };
-    return [...arr].sort((a, b) => {
-      const ac = a.stores?.code ?? "";
-      const bc = b.stores?.code ?? "";
-      if (ac !== bc) return ac.localeCompare(bc);
-      return (metalOrder[a.metal] ?? 9) - (metalOrder[b.metal] ?? 9);
-    });
-  }
+  function queueSave(id: string, patch: Partial<LineRow>) {
+    setLines((prev) => prev.map((l) => (l.id === id ? ({ ...l, ...patch } as LineRow) : l)));
 
-  // auto load bij change
-  useEffect(() => {
-    if (!session) return;
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session, runDate, weekday]);
-
-  // --- Save (debounced) ---
-  function queueSave(id: string, patch: Partial<Pick<LineRow, "picker" | "status">>) {
-    // optimistic update
-    setLines((prev) =>
-      prev.map((l) => (l.id === id ? { ...l, ...patch } as LineRow : l))
-    );
-
-    // debounce per row
     if (saveTimers.current[id]) clearTimeout(saveTimers.current[id]);
     saveTimers.current[id] = setTimeout(async () => {
       setSavingIds((s) => ({ ...s, [id]: true }));
@@ -229,7 +230,6 @@ export default function Home() {
         if (!res.ok) {
           throw new Error(json?.error?.message ?? json?.error ?? "Update mislukt");
         }
-        // auditError niet blokkeren
       } catch (e: any) {
         alert(e?.message ?? "Fout bij opslaan");
       } finally {
@@ -241,6 +241,12 @@ export default function Home() {
       }
     }, 250);
   }
+
+  useEffect(() => {
+    if (!session) return;
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session, runDate, weekday]);
 
   // --- UI ---
   if (authLoading) {
@@ -254,17 +260,29 @@ export default function Home() {
           onSubmit={signIn}
           style={{
             width: "100%",
-            maxWidth: 420,
+            maxWidth: 440,
             border: "1px solid #e5e5e5",
-            borderRadius: 12,
-            padding: 16,
+            borderRadius: 14,
+            padding: 18,
             background: "white",
           }}
         >
+          {/* LOGO login */}
+          <div style={{ display: "flex", justifyContent: "center", marginBottom: 12 }}>
+            <img
+              src="/logo.png"
+              alt="Twice As Nice"
+              style={{
+                width: LOGIN_BRAND_WIDTH_PX,
+                height: "auto",
+                maxWidth: "100%",
+                opacity: 0.98,
+              }}
+            />
+          </div>
+
           <h1 style={{ margin: 0, fontSize: 22 }}>Login</h1>
-          <p style={{ marginTop: 8, color: "#666" }}>
-            Gebruik jullie algemene account.
-          </p>
+          <p style={{ marginTop: 8, color: "#666" }}>Gebruik jullie algemene account.</p>
 
           <label style={{ display: "block", marginTop: 12, fontSize: 14 }}>Email</label>
           <input
@@ -294,6 +312,7 @@ export default function Home() {
               background: "#111",
               color: "white",
               fontWeight: 700,
+              cursor: "pointer",
             }}
           >
             Inloggen
@@ -369,9 +388,34 @@ export default function Home() {
           border: 1px solid #ddd;
           background: #f6f6f6;
           font-weight: 700;
+          cursor: pointer;
         }
 
-        /* Mobile layout: table -> cards */
+        /* brand */
+        .brandWrapStack {
+          display: flex;
+          flex-direction: column;
+          align-items: flex-end;
+          gap: 8px;
+        }
+        .brandWrapInline {
+          display: flex;
+          flex-direction: row;
+          align-items: center;
+          gap: 10px;
+        }
+        .brandBox {
+          width: ${BRAND_WIDTH_PX}px;
+          max-width: 100%;
+        }
+        .brandImg {
+          width: 100%;
+          height: auto;
+          display: block;
+          opacity: 0.95;
+        }
+
+        /* Mobile layout: table -> blocks */
         @media (max-width: 720px) {
           h1 { font-size: 40px !important; line-height: 1.02; }
           .input, .select { max-width: none; }
@@ -382,13 +426,6 @@ export default function Home() {
             padding: 10px;
           }
           td { border: 0; padding: 6px 0; }
-          .rowGrid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 8px 10px;
-            align-items: center;
-          }
-          .rowGrid .full { grid-column: 1 / -1; }
           .storeCode { font-size: 18px; }
         }
       `}</style>
@@ -403,14 +440,14 @@ export default function Home() {
           </div>
         </div>
 
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6 }}>
-  <button className="logout" onClick={signOut}>Logout</button>
-  <img
-    src="/logo.png"
-    alt="Twice As Nice"
-    style={{ height: 26, width: "auto", opacity: 0.95 }}
-  />
-</div>
+        {/* OPTIE A of B */}
+        <div className={BRAND_MODE === "stack" ? "brandWrapStack" : "brandWrapInline"}>
+          <button className="logout" onClick={signOut}>Logout</button>
+
+          <div className="brandBox">
+            <img src="/logo.png" alt="Twice As Nice" className="brandImg" />
+          </div>
+        </div>
       </div>
 
       <div className="filters" style={{ marginTop: 14 }}>
@@ -453,17 +490,18 @@ export default function Home() {
               </tr>
             ) : (
               lines.map((l) => {
-                const code = l.stores?.code ?? "";
+                const code = normalizeStoreCode(l);
                 const bg = rowBg(l.status);
                 const saving = !!savingIds[l.id];
 
                 return (
                   <tr key={l.id} style={{ background: bg }}>
-                    {/* Desktop cells */}
                     <td>
                       <span className="storeCode">{code}</span>
                     </td>
+
                     <td style={{ fontWeight: 800 }}>{l.metal}</td>
+
                     <td>
                       <input
                         className="input"
@@ -473,6 +511,7 @@ export default function Home() {
                         style={{ opacity: saving ? 0.65 : 1 }}
                       />
                     </td>
+
                     <td>
                       <select
                         className="select"
@@ -484,11 +523,6 @@ export default function Home() {
                         <option value="BEZIG">Bezig</option>
                         <option value="KLAAR">Klaar</option>
                       </select>
-
-                      {/* Mobile extra layout helper */}
-                      <div className="rowGrid" style={{ display: "none" }}>
-                        {/* blijft leeg; alleen voor media-query block layout */}
-                      </div>
                     </td>
                   </tr>
                 );
@@ -499,7 +533,7 @@ export default function Home() {
       </div>
 
       <div style={{ marginTop: 10, color: "#666", fontSize: 13 }}>
-        Tip: status <b>Bezig</b> = rood, <b>Klaar</b> = groen. Alles wordt automatisch opgeslagen.
+        Tip: status <b>Bezig</b> = rood, <b>Klaar</b> = groen.
       </div>
     </div>
   );
