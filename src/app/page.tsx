@@ -49,7 +49,6 @@ function nlTitle(weekday: number, runDate: string) {
 }
 
 function rowBg(status: Status) {
-  // iets duidelijker kleuren
   if (status === "KLAAR") return "rgba(0, 170, 70, 0.28)";
   if (status === "BEZIG") return "rgba(230, 0, 0, 0.25)";
   return "transparent";
@@ -65,8 +64,11 @@ function normalizeStore(line: LineRow): StoreMini | null {
 function storeLabel(line: LineRow) {
   const s = normalizeStore(line);
   if (!s) return "";
-  // fix "CIT-CIT" achtig: we tonen enkel code
   return (s.code ?? "").toUpperCase();
+}
+
+function makeKey(store_id: string, metal: Metal) {
+  return `${store_id}__${metal}`;
 }
 
 export default function Home() {
@@ -93,7 +95,7 @@ export default function Home() {
   const [savingIds, setSavingIds] = useState<Record<string, boolean>>({});
   const saveTimers = useRef<Record<string, any>>({});
 
-  // ✅ Belangrijk voor realtime: huidige run_id
+  // ✅ huidige run_id
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
 
   const klaarCount = useMemo(() => lines.filter((l) => l.status === "KLAAR").length, [lines]);
@@ -133,7 +135,7 @@ export default function Home() {
   }
 
   // -----------------------
-  // LOAD (GEEN AUTO-RESET)
+  // LOAD (ZONDER DUPLICATES / ZONDER RESET)
   // -----------------------
   async function load() {
     setLoading(true);
@@ -167,30 +169,51 @@ export default function Home() {
         .select("store_id")
         .eq("weekday", weekday);
 
-      const storeIds = (templ.data ?? []).map((t: any) => t.store_id);
+      const storeIds: string[] = (templ.data ?? []).map((t: any) => t.store_id);
 
       if (!storeIds.length) {
         setLines([]);
         return;
       }
 
-      // 3) Ensure lines exist for run (ZILVER+STAAL) BUT DO NOT overwrite status/picker
-      const base = storeIds.flatMap((store_id: string) => [
-        { run_id: runId, store_id, metal: "ZILVER" as Metal },
-        { run_id: runId, store_id, metal: "STAAL" as Metal },
-      ]);
+      // 3) Haal bestaande lines op voor deze run + stores
+      //    (BELANGRIJK: we maken enkel ontbrekende combinaties aan — geen upsert)
+      const existingRes = await supabase
+        .from("picking_lines")
+        .select("id,run_id,store_id,metal,picker,status,stores:stores(code,name)")
+        .eq("run_id", runId)
+        .in("store_id", storeIds);
 
-      // ✅ ignoreDuplicates = true => bestaande rijen worden NIET overschreven (geen reset!)
-      await supabase.from("picking_lines").upsert(base, {
-        onConflict: "run_id,store_id,metal",
-        ignoreDuplicates: true,
-      });
+      const existing = (existingRes.data ?? []) as LineRow[];
 
-      // 4) Fetch lines with stores join
+      const existingKeys = new Set<string>();
+      for (const l of existing) existingKeys.add(makeKey(l.store_id, l.metal));
+
+      const toInsert: Array<{ run_id: string; store_id: string; metal: Metal }> = [];
+      for (const store_id of storeIds) {
+        for (const metal of ["ZILVER", "STAAL"] as Metal[]) {
+          const key = makeKey(store_id, metal);
+          if (!existingKeys.has(key)) {
+            toInsert.push({ run_id: runId, store_id, metal });
+          }
+        }
+      }
+
+      if (toInsert.length) {
+        const ins = await supabase.from("picking_lines").insert(toInsert);
+        if (ins.error) {
+          // als insert faalt: toon fout (maar crash niet)
+          console.error("Insert missing picking_lines error", ins.error);
+          setInfo(ins.error.message);
+        }
+      }
+
+      // 4) Final fetch (met stores join)
       const linesRes = await supabase
         .from("picking_lines")
         .select("id,run_id,store_id,metal,picker,status,stores:stores(code,name)")
-        .eq("run_id", runId);
+        .eq("run_id", runId)
+        .in("store_id", storeIds);
 
       const normalized = (linesRes.data ?? []) as LineRow[];
 
@@ -204,7 +227,7 @@ export default function Home() {
       });
 
       setLines(normalized);
-    } catchena: any) {
+    } catch (e: any) {
       setInfo(e?.message ?? "Fout bij laden");
     } finally {
       setLoading(false);
@@ -236,11 +259,28 @@ export default function Home() {
           body: JSON.stringify({ id, patch }),
         });
 
-        // als er server error is, toon die zodat je het ziet
         const json = await res.json().catch(() => ({}));
+
         if (!res.ok) {
           console.error("update-line error", json);
           setInfo(json?.error ?? "Opslaan mislukt");
+          // Bij fout: haal opnieuw op zodat UI niet “terugspringt” raar
+          load();
+          return;
+        }
+
+        // Als server data terugstuurt: update state met de “truth”
+        if (json?.data?.id) {
+          const newRow = json.data;
+          setLines((prev) => {
+            const idx = prev.findIndex((l) => l.id === newRow.id);
+            if (idx === -1) return prev;
+            const keepStores = prev[idx].stores;
+            const merged: LineRow = { ...prev[idx], ...newRow, stores: keepStores };
+            const copy = [...prev];
+            copy[idx] = merged;
+            return copy;
+          });
         }
       } finally {
         setSavingIds((s) => {
@@ -269,35 +309,61 @@ export default function Home() {
           filter: `run_id=eq.${activeRunId}`,
         },
         (payload) => {
+          const eventType = payload.eventType;
           const newRow = payload.new as any;
-
-          if (!newRow?.id) return;
+          const oldRow = payload.old as any;
 
           setLines((prev) => {
-            const idx = prev.findIndex((l) => l.id === newRow.id);
-            if (idx === -1) return prev;
+            // DELETE
+            if (eventType === "DELETE") {
+              const id = oldRow?.id;
+              if (!id) return prev;
+              return prev.filter((l) => l.id !== id);
+            }
 
-            // ⚠️ payload.new heeft geen join "stores", dus we behouden die van de bestaande rij
+            // INSERT/UPDATE
+            const id = newRow?.id;
+            if (!id) return prev;
+
+            const idx = prev.findIndex((l) => l.id === id);
+
+            // INSERT (nog niet in lijst)
+            if (idx === -1) {
+              // payload heeft geen join "stores" → we voegen toe zonder stores
+              const appended: LineRow = {
+                id: newRow.id,
+                run_id: newRow.run_id,
+                store_id: newRow.store_id,
+                metal: newRow.metal,
+                picker: newRow.picker ?? null,
+                status: newRow.status,
+                stores: null,
+              };
+
+              const copy = [...prev, appended];
+
+              // sort opnieuw (code kan leeg zijn als stores ontbreekt, maar ok)
+              copy.sort((a, b) => {
+                const ac = storeLabel(a);
+                const bc = storeLabel(b);
+                const c = ac.localeCompare(bc);
+                if (c !== 0) return c;
+                return a.metal === b.metal ? 0 : a.metal === "ZILVER" ? -1 : 1;
+              });
+
+              return copy;
+            }
+
+            // UPDATE (bestaat al)
             const keepStores = prev[idx].stores;
-
-            const merged: LineRow = {
-              ...prev[idx],
-              ...newRow,
-              stores: keepStores,
-            };
-
+            const merged: LineRow = { ...prev[idx], ...newRow, stores: keepStores };
             const updated = [...prev];
             updated[idx] = merged;
             return updated;
           });
         }
       )
-      .subscribe((status) => {
-        if (status === "SUBSCRIBED") {
-          // handig om te weten dat live actief is
-          // console.log("Realtime subscribed");
-        }
-      });
+      .subscribe();
 
     return () => {
       supabase.removeChannel(channel);
@@ -494,9 +560,7 @@ export default function Home() {
                       </div>
                     </td>
 
-                    <td style={{ padding: 10, borderBottom: "1px solid #f2f2f2" }}>
-                      {line.metal}
-                    </td>
+                    <td style={{ padding: 10, borderBottom: "1px solid #f2f2f2" }}>{line.metal}</td>
 
                     <td style={{ padding: 10, borderBottom: "1px solid #f2f2f2" }}>
                       <input
