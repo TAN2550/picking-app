@@ -93,7 +93,10 @@ export default function Home() {
   const [info, setInfo] = useState("");
   const [lines, setLines] = useState<LineRow[]>([]);
   const [savingIds, setSavingIds] = useState<Record<string, boolean>>({});
+
+  // timers + pending patches (✅ nieuw: patches per rij bundelen)
   const saveTimers = useRef<Record<string, any>>({});
+  const pendingPatches = useRef<Record<string, Partial<LineRow>>>({});
 
   // ✅ huidige run_id
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
@@ -244,19 +247,25 @@ export default function Home() {
   // -----------------------
   // SAVE (via jouw route)
   // -----------------------
-  function queueSave(id: string, patch: Partial<LineRow>) {
+  function queueSave(id: string, patch: Partial<LineRow>, delayMs: number) {
     // optimistic UI
     setLines((prev) => prev.map((l) => (l.id === id ? ({ ...l, ...patch } as LineRow) : l)));
+
+    // ✅ bundel patches per rij (zodat status+picker samen kunnen)
+    pendingPatches.current[id] = { ...(pendingPatches.current[id] ?? {}), ...patch };
 
     if (saveTimers.current[id]) clearTimeout(saveTimers.current[id]);
 
     saveTimers.current[id] = setTimeout(async () => {
+      const patchToSend = pendingPatches.current[id] ?? {};
+      delete pendingPatches.current[id];
+
       setSavingIds((s) => ({ ...s, [id]: true }));
       try {
         const res = await fetch("/api/update-line", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id, patch }),
+          body: JSON.stringify({ id, patch: patchToSend }),
         });
 
         const json = await res.json().catch(() => ({}));
@@ -264,7 +273,6 @@ export default function Home() {
         if (!res.ok) {
           console.error("update-line error", json);
           setInfo(json?.error ?? "Opslaan mislukt");
-          // Bij fout: haal opnieuw op zodat UI niet “terugspringt” raar
           load();
           return;
         }
@@ -289,7 +297,18 @@ export default function Home() {
           return copy;
         });
       }
-    }, 250);
+    }, delayMs);
+  }
+
+  // ✅ helper wrappers (duidelijk)
+  function queueSavePicker(id: string, picker: string) {
+    // 5 seconden debounce voor typen
+    queueSave(id, { picker }, 5000);
+  }
+
+  function queueSaveStatus(id: string, status: Status) {
+    // snel voor dropdown
+    queueSave(id, { status }, 300);
   }
 
   // -----------------------
@@ -329,7 +348,6 @@ export default function Home() {
 
             // INSERT (nog niet in lijst)
             if (idx === -1) {
-              // payload heeft geen join "stores" → we voegen toe zonder stores
               const appended: LineRow = {
                 id: newRow.id,
                 run_id: newRow.run_id,
@@ -342,7 +360,6 @@ export default function Home() {
 
               const copy = [...prev, appended];
 
-              // sort opnieuw (code kan leeg zijn als stores ontbreekt, maar ok)
               copy.sort((a, b) => {
                 const ac = storeLabel(a);
                 const bc = storeLabel(b);
@@ -565,7 +582,7 @@ export default function Home() {
                     <td style={{ padding: 10, borderBottom: "1px solid #f2f2f2" }}>
                       <input
                         value={line.picker ?? ""}
-                        onChange={(e) => queueSave(line.id, { picker: e.target.value })}
+                        onChange={(e) => queueSavePicker(line.id, e.target.value)}
                         placeholder="Naam"
                         style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd", width: "100%" }}
                       />
@@ -574,7 +591,7 @@ export default function Home() {
                     <td style={{ padding: 10, borderBottom: "1px solid #f2f2f2" }}>
                       <select
                         value={line.status}
-                        onChange={(e) => queueSave(line.id, { status: e.target.value as Status })}
+                        onChange={(e) => queueSaveStatus(line.id, e.target.value as Status)}
                         style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd", width: "100%" }}
                       >
                         <option value="TE_DOEN">Te doen</option>
