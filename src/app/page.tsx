@@ -4,13 +4,9 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 /** =======================
- *  INSTELLING: kies layout
+ *  BRAND / LAYOUT
  *  ======================= */
-// A = logo ONDER logout (stack)
-// B = logo NAAST logout (inline)
 const BRAND_MODE: "stack" | "inline" = "stack";
-
-// pas dit aan als je logo groter/kleiner wil
 const BRAND_WIDTH_PX = 140;
 const LOGIN_BRAND_WIDTH_PX = 180;
 
@@ -26,6 +22,7 @@ type LineRow = {
   metal: Metal;
   picker: string | null;
   status: Status;
+  // join
   stores?: StoreMini | StoreMini[] | null;
 };
 
@@ -52,16 +49,24 @@ function nlTitle(weekday: number, runDate: string) {
 }
 
 function rowBg(status: Status) {
-  if (status === "KLAAR") return "rgba(0, 160, 60, 0.20)";
-  if (status === "BEZIG") return "rgba(220, 0, 0, 0.18)";
+  // iets duidelijker kleuren
+  if (status === "KLAAR") return "rgba(0, 170, 70, 0.28)";
+  if (status === "BEZIG") return "rgba(230, 0, 0, 0.25)";
   return "transparent";
 }
 
-function normalizeStoreCode(line: LineRow) {
+function normalizeStore(line: LineRow): StoreMini | null {
   const s = line.stores as any;
+  if (!s) return null;
+  if (Array.isArray(s)) return s[0] ?? null;
+  return s ?? null;
+}
+
+function storeLabel(line: LineRow) {
+  const s = normalizeStore(line);
   if (!s) return "";
-  if (Array.isArray(s)) return s[0]?.code ?? "";
-  return s.code ?? "";
+  // fix "CIT-CIT" achtig: we tonen enkel code
+  return (s.code ?? "").toUpperCase();
 }
 
 export default function Home() {
@@ -73,27 +78,30 @@ export default function Home() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
 
-  // --- Picking state ---
+  // --- Picking filters ---
   const [runDate, setRunDate] = useState(() => formatLocalYYYYMMDD(new Date()));
   const [weekday, setWeekday] = useState<number>(() => {
-    const jsDay = new Date().getDay();
+    const jsDay = new Date().getDay(); // 0=Sun
     const map: Record<number, number> = { 2: 2, 3: 3, 4: 4, 5: 5 };
     return map[jsDay] ?? 2;
   });
 
+  // --- Data ---
   const [loading, setLoading] = useState(false);
   const [info, setInfo] = useState("");
   const [lines, setLines] = useState<LineRow[]>([]);
   const [savingIds, setSavingIds] = useState<Record<string, boolean>>({});
   const saveTimers = useRef<Record<string, any>>({});
 
-  // 👉 NIEUW: actieve run voor realtime
+  // ✅ Belangrijk voor realtime: huidige run_id
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
 
   const klaarCount = useMemo(() => lines.filter((l) => l.status === "KLAAR").length, [lines]);
   const totalCount = useMemo(() => lines.length, [lines]);
 
-  // --- Auth init ---
+  // -----------------------
+  // AUTH INIT
+  // -----------------------
   useEffect(() => {
     let unsub: any = null;
 
@@ -124,12 +132,15 @@ export default function Home() {
     await supabase.auth.signOut();
   }
 
-  // --- Load picking data ---
+  // -----------------------
+  // LOAD (GEEN AUTO-RESET)
+  // -----------------------
   async function load() {
     setLoading(true);
     setInfo("");
 
     try {
+      // 1) Get/Create run for date
       const runRes = await supabase
         .from("picking_runs")
         .select("id")
@@ -147,11 +158,10 @@ export default function Home() {
         runId = created.data?.id;
       }
 
-      if (!runId) throw new Error("Geen runId");
-
-      // 👉 NIEUW: zet actieve run voor realtime
+      if (!runId) throw new Error("Geen runId gevonden/gemaakt.");
       setActiveRunId(runId);
 
+      // 2) Get template stores for weekday
       const templ = await supabase
         .from("picking_templates")
         .select("store_id")
@@ -164,20 +174,19 @@ export default function Home() {
         return;
       }
 
-      const storesRes = await supabase
-        .from("stores")
-        .select("id,code,name")
-        .in("id", storeIds);
-
-      const storeRows = storesRes.data ?? [];
-
-      const base = storeRows.flatMap((s: any) => [
-        { run_id: runId, store_id: s.id, metal: "ZILVER", status: "TE_DOEN" as Status },
-        { run_id: runId, store_id: s.id, metal: "STAAL", status: "TE_DOEN" as Status },
+      // 3) Ensure lines exist for run (ZILVER+STAAL) BUT DO NOT overwrite status/picker
+      const base = storeIds.flatMap((store_id: string) => [
+        { run_id: runId, store_id, metal: "ZILVER" as Metal },
+        { run_id: runId, store_id, metal: "STAAL" as Metal },
       ]);
 
-      await supabase.from("picking_lines").upsert(base, { onConflict: "run_id,store_id,metal" });
+      // ✅ ignoreDuplicates = true => bestaande rijen worden NIET overschreven (geen reset!)
+      await supabase.from("picking_lines").upsert(base, {
+        onConflict: "run_id,store_id,metal",
+        ignoreDuplicates: true,
+      });
 
+      // 4) Fetch lines with stores join
       const linesRes = await supabase
         .from("picking_lines")
         .select("id,run_id,store_id,metal,picker,status,stores:stores(code,name)")
@@ -185,34 +194,54 @@ export default function Home() {
 
       const normalized = (linesRes.data ?? []) as LineRow[];
 
+      // sort by store code then metal
       normalized.sort((a, b) => {
-        const ac = normalizeStoreCode(a);
-        const bc = normalizeStoreCode(b);
+        const ac = storeLabel(a);
+        const bc = storeLabel(b);
         const c = ac.localeCompare(bc);
         if (c !== 0) return c;
         return a.metal === b.metal ? 0 : a.metal === "ZILVER" ? -1 : 1;
       });
 
       setLines(normalized);
-    } catch (e: any) {
+    } catchena: any) {
       setInfo(e?.message ?? "Fout bij laden");
     } finally {
       setLoading(false);
     }
   }
 
+  // laad bij start en bij filterwijziging
+  useEffect(() => {
+    if (!session) return;
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session, runDate, weekday]);
+
+  // -----------------------
+  // SAVE (via jouw route)
+  // -----------------------
   function queueSave(id: string, patch: Partial<LineRow>) {
+    // optimistic UI
     setLines((prev) => prev.map((l) => (l.id === id ? ({ ...l, ...patch } as LineRow) : l)));
 
     if (saveTimers.current[id]) clearTimeout(saveTimers.current[id]);
+
     saveTimers.current[id] = setTimeout(async () => {
       setSavingIds((s) => ({ ...s, [id]: true }));
       try {
-        await fetch("/api/update-line", {
+        const res = await fetch("/api/update-line", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ id, patch }),
         });
+
+        // als er server error is, toon die zodat je het ziet
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          console.error("update-line error", json);
+          setInfo(json?.error ?? "Opslaan mislukt");
+        }
       } finally {
         setSavingIds((s) => {
           const copy = { ...s };
@@ -223,12 +252,14 @@ export default function Home() {
     }, 250);
   }
 
-  // 🔴 🔴 🔴 REALTIME SYNCHRONISATIE 🔴 🔴 🔴
+  // -----------------------
+  // ✅ REALTIME (LIVE SYNC)
+  // -----------------------
   useEffect(() => {
     if (!session || !activeRunId) return;
 
     const channel = supabase
-      .channel(`realtime-picking-${activeRunId}`)
+      .channel(`realtime-picking-lines-${activeRunId}`)
       .on(
         "postgres_changes",
         {
@@ -238,46 +269,95 @@ export default function Home() {
           filter: `run_id=eq.${activeRunId}`,
         },
         (payload) => {
-          const newRow = payload.new as LineRow;
+          const newRow = payload.new as any;
+
           if (!newRow?.id) return;
 
           setLines((prev) => {
             const idx = prev.findIndex((l) => l.id === newRow.id);
-            if (idx !== -1) {
-              const updated = [...prev];
-              updated[idx] = { ...updated[idx], ...newRow };
-              return updated;
-            }
-            return prev;
+            if (idx === -1) return prev;
+
+            // ⚠️ payload.new heeft geen join "stores", dus we behouden die van de bestaande rij
+            const keepStores = prev[idx].stores;
+
+            const merged: LineRow = {
+              ...prev[idx],
+              ...newRow,
+              stores: keepStores,
+            };
+
+            const updated = [...prev];
+            updated[idx] = merged;
+            return updated;
           });
         }
       )
-      .subscribe();
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          // handig om te weten dat live actief is
+          // console.log("Realtime subscribed");
+        }
+      });
 
     return () => {
       supabase.removeChannel(channel);
     };
   }, [session, activeRunId]);
 
-  useEffect(() => {
-    if (!session) return;
-    load();
-  }, [session, runDate, weekday]);
-
-  // --- UI ---
+  // -----------------------
+  // UI
+  // -----------------------
   if (authLoading) return <div style={{ padding: 16 }}>Laden…</div>;
 
   if (!session) {
     return (
       <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 16 }}>
-        <form onSubmit={signIn} style={{ maxWidth: 440, width: "100%", padding: 18, border: "1px solid #eee" }}>
+        <form
+          onSubmit={signIn}
+          style={{
+            maxWidth: 460,
+            width: "100%",
+            padding: 18,
+            border: "1px solid #eee",
+            borderRadius: 12,
+            background: "#fff",
+          }}
+        >
           <div style={{ textAlign: "center", marginBottom: 12 }}>
-            <img src="/logo.png" style={{ width: LOGIN_BRAND_WIDTH_PX }} />
+            <img src="/logo.png" alt="Logo" style={{ width: LOGIN_BRAND_WIDTH_PX }} />
           </div>
-          <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" />
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Wachtwoord" />
-          <button type="submit">Inloggen</button>
-          {info && <div>{info}</div>}
+
+          <div style={{ display: "grid", gap: 10 }}>
+            <input
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="Email"
+              autoComplete="username"
+              style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+            />
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Wachtwoord"
+              autoComplete="current-password"
+              style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+            />
+            <button
+              type="submit"
+              style={{
+                padding: 10,
+                borderRadius: 10,
+                border: "1px solid #111",
+                background: "#111",
+                color: "#fff",
+                cursor: "pointer",
+              }}
+            >
+              Inloggen
+            </button>
+            {info && <div style={{ color: "#b00020" }}>{info}</div>}
+          </div>
         </form>
       </div>
     );
@@ -285,8 +365,174 @@ export default function Home() {
 
   return (
     <div style={{ padding: 14, maxWidth: 1100, margin: "0 auto" }}>
-      {/* UI ongewijzigd */}
-      {/* ... rest exact hetzelfde als bij jou ... */}
+      {/* Header */}
+      <div
+        style={{
+          display: "flex",
+          gap: 12,
+          alignItems: "flex-start",
+          justifyContent: "space-between",
+          marginBottom: 12,
+        }}
+      >
+        <div>
+          <div style={{ fontSize: 22, fontWeight: 700 }}>{nlTitle(weekday, runDate)}</div>
+          <div style={{ marginTop: 4, color: "#666" }}>
+            Klaar: <b>{klaarCount}</b> / {totalCount}
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+          <button
+            onClick={signOut}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 10,
+              border: "1px solid #ddd",
+              background: "#fff",
+              cursor: "pointer",
+            }}
+          >
+            Logout
+          </button>
+
+          {BRAND_MODE === "inline" ? (
+            <img src="/logo.png" alt="Logo" style={{ width: BRAND_WIDTH_PX }} />
+          ) : null}
+        </div>
+      </div>
+
+      {BRAND_MODE === "stack" ? (
+        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: -6, marginBottom: 12 }}>
+          <img src="/logo.png" alt="Logo" style={{ width: BRAND_WIDTH_PX }} />
+        </div>
+      ) : null}
+
+      {/* Filters */}
+      <div
+        style={{
+          display: "flex",
+          gap: 12,
+          alignItems: "center",
+          flexWrap: "wrap",
+          marginBottom: 12,
+        }}
+      >
+        <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span style={{ color: "#444" }}>Datum</span>
+          <input
+            type="date"
+            value={runDate}
+            onChange={(e) => setRunDate(e.target.value)}
+            style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+          />
+        </label>
+
+        <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span style={{ color: "#444" }}>Dag</span>
+          <select
+            value={weekday}
+            onChange={(e) => setWeekday(parseInt(e.target.value, 10))}
+            style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+          >
+            {WEEKDAYS.map((d) => (
+              <option key={d.value} value={d.value}>
+                {d.label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <button
+          onClick={load}
+          disabled={loading}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 10,
+            border: "1px solid #ddd",
+            background: "#fff",
+            cursor: "pointer",
+          }}
+        >
+          {loading ? "Laden…" : "Refresh"}
+        </button>
+
+        {info && <div style={{ color: "#b00020" }}>{info}</div>}
+      </div>
+
+      {/* Table */}
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead>
+            <tr style={{ textAlign: "left" }}>
+              <th style={{ padding: 10, borderBottom: "1px solid #eee" }}>Winkel</th>
+              <th style={{ padding: 10, borderBottom: "1px solid #eee" }}>Metaal</th>
+              <th style={{ padding: 10, borderBottom: "1px solid #eee" }}>Picker</th>
+              <th style={{ padding: 10, borderBottom: "1px solid #eee" }}>Status</th>
+              <th style={{ padding: 10, borderBottom: "1px solid #eee" }}></th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {lines.length === 0 ? (
+              <tr>
+                <td colSpan={5} style={{ padding: 14, color: "#666" }}>
+                  Geen winkels voor deze dag.
+                </td>
+              </tr>
+            ) : (
+              lines.map((line) => {
+                const store = normalizeStore(line);
+                const saving = !!savingIds[line.id];
+
+                return (
+                  <tr key={line.id} style={{ background: rowBg(line.status) }}>
+                    <td style={{ padding: 10, borderBottom: "1px solid #f2f2f2", fontWeight: 700 }}>
+                      {store?.code?.toUpperCase() ?? ""}
+                      <div style={{ fontWeight: 400, color: "#666", fontSize: 12 }}>
+                        {store?.name ?? ""}
+                      </div>
+                    </td>
+
+                    <td style={{ padding: 10, borderBottom: "1px solid #f2f2f2" }}>
+                      {line.metal}
+                    </td>
+
+                    <td style={{ padding: 10, borderBottom: "1px solid #f2f2f2" }}>
+                      <input
+                        value={line.picker ?? ""}
+                        onChange={(e) => queueSave(line.id, { picker: e.target.value })}
+                        placeholder="Naam"
+                        style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd", width: "100%" }}
+                      />
+                    </td>
+
+                    <td style={{ padding: 10, borderBottom: "1px solid #f2f2f2" }}>
+                      <select
+                        value={line.status}
+                        onChange={(e) => queueSave(line.id, { status: e.target.value as Status })}
+                        style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd", width: "100%" }}
+                      >
+                        <option value="TE_DOEN">Te doen</option>
+                        <option value="BEZIG">Bezig</option>
+                        <option value="KLAAR">Klaar</option>
+                      </select>
+                    </td>
+
+                    <td style={{ padding: 10, borderBottom: "1px solid #f2f2f2", color: "#666", fontSize: 12 }}>
+                      {saving ? "Opslaan…" : ""}
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ marginTop: 10, color: "#666", fontSize: 13 }}>
+        Tip: status <b>Bezig</b> = rood, <b>Klaar</b> = groen.
+      </div>
     </div>
   );
 }
